@@ -7,6 +7,7 @@
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/components/number/number.h"
+#include "esphome/components/switch/switch.h"
 
 #include <string>
 #include <driver/i2s_std.h>
@@ -94,6 +95,9 @@ class I2SAudioUDP : public Component {
   // AEC Integration
   // ─────────────────────────────────────────────────────────────────────────
   void set_aec(esp_aec::EspAec *aec) { this->aec_ = aec; }
+  void set_aec_enabled(bool enabled) { this->aec_enabled_ = enabled; }
+  bool is_aec_enabled() const { return this->aec_enabled_; }
+  bool has_aec() const { return this->aec_ != nullptr; }
 
   // ─────────────────────────────────────────────────────────────────────────
   // Control Methods (called from automations)
@@ -170,6 +174,7 @@ class I2SAudioUDP : public Component {
 
   // AEC
   esp_aec::EspAec *aec_{nullptr};
+  bool aec_enabled_{true};  // Default enabled when AEC component is linked
 
   // Deduced modes
   I2SBusMode bus_mode_{I2S_BUS_SINGLE};
@@ -253,6 +258,28 @@ class I2SAudioUDPVolume : public number::Number, public Component {
     this->publish_state(value);
     if (this->parent_ != nullptr) {
       this->parent_->set_volume(value / 100.0f);
+    }
+  }
+
+  I2SAudioUDP *parent_{nullptr};
+};
+
+// AEC Switch
+class I2SAudioUDPAecSwitch : public switch_::Switch, public Component {
+ public:
+  void set_parent(I2SAudioUDP *parent) { this->parent_ = parent; }
+  void setup() override {
+    // Publish initial state (enabled by default if AEC is configured)
+    if (this->parent_ != nullptr && this->parent_->has_aec()) {
+      this->publish_state(this->parent_->is_aec_enabled());
+    }
+  }
+
+ protected:
+  void write_state(bool state) override {
+    if (this->parent_ != nullptr) {
+      this->parent_->set_aec_enabled(state);
+      this->publish_state(state);
     }
   }
 

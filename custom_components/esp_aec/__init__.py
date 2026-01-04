@@ -1,13 +1,23 @@
 """
 ESP AEC Component for ESPHome
-Acoustic Echo Cancellation wrapper for ESP-AFE
+Acoustic Echo Cancellation using ESP-SR library
+
+Requirements:
+- ESP32-S3 with PSRAM (octal mode recommended)
+- ESP-IDF framework
+- esp-sr component added via yaml:
+    esp32:
+      framework:
+        type: esp-idf
+        components:
+          - espressif/esp-sr
 """
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.const import CONF_ID
 
 CODEOWNERS = ["@n-IA-hane"]
-DEPENDENCIES = []
+DEPENDENCIES = ["esp32"]
 
 CONF_SAMPLE_RATE = "sample_rate"
 CONF_FILTER_LENGTH = "filter_length"
@@ -31,6 +41,5 @@ async def to_code(config):
     cg.add(var.set_sample_rate(config[CONF_SAMPLE_RATE]))
     cg.add(var.set_filter_length(config[CONF_FILTER_LENGTH]))
 
-    # Add ESP-SR component dependency
-    cg.add_platformio_option("lib_deps", ["espressif/esp-sr@^2.3.0"])
+    # Enable AEC compilation (requires esp-sr in framework.components)
     cg.add_define("USE_ESP_AEC")

@@ -6,7 +6,7 @@ A full-duplex audio intercom system using ESP32-S3 with ESPHome and Home Assista
 ![ESPHome](https://img.shields.io/badge/ESPHome-2025.5+-green)
 ![Home Assistant](https://img.shields.io/badge/Home%20Assistant-Compatible-orange)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
-![Version](https://img.shields.io/badge/Version-4.1-brightgreen)
+![Version](https://img.shields.io/badge/Version-4.2-brightgreen)
 
 ---
 
@@ -47,7 +47,7 @@ https://github.com/n-IA-hane/esphome-intercom/raw/master/readme_img/call.mp4
 ### Core Features
 - **Full Duplex Audio**: Simultaneous microphone and speaker operation
 - **Crystal Clear Audio**: ESPHome RingBuffer with optimized jitter handling - no glitches!
-- **Echo Cancellation (AEC)**: ESP-AFE powered acoustic echo cancellation with ON/OFF switch
+- **Echo Cancellation (AEC)**: ESP-SR powered acoustic echo cancellation with ON/OFF switch
 - **WebRTC Support**: Stream audio to any browser via go2rtc
 - **Home Assistant Integration**: Full control from HA dashboards and Companion app
 - **Volume Control**: Adjustable speaker volume (hardware or software)
@@ -385,12 +385,42 @@ The round display (Xiaozhi only) shows different colors and text based on the cu
 
 ## Echo Cancellation (AEC)
 
-ESP-AFE Acoustic Echo Cancellation powered by Espressif's official audio front-end library.
+ESP-SR Acoustic Echo Cancellation powered by Espressif's Speech Recognition library.
 
 - **Toggle via Home Assistant**: Use the "Echo Cancellation" switch
 - **Restart required**: Stop and restart streaming to apply changes
 - **Resource usage**: ~22% CPU when enabled
 - **Best for**: go2rtc mode where you hear your own voice back
+
+### Enabling AEC in Your Configuration
+
+AEC requires the ESP-SR component to be included in your ESP-IDF framework:
+
+```yaml
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+    components:
+      - espressif/esp-sr^2.3.0  # Required for AEC
+
+external_components:
+  - source:
+      type: local
+      path: custom_components
+    components: [i2s_audio_udp, esp_aec]
+
+esp_aec:
+  id: echo_canceller
+  sample_rate: 16000
+  filter_length: 4
+
+i2s_audio_udp:
+  # ... your pin configuration ...
+  aec_id: echo_canceller  # Link to AEC component
+```
+
+**Requirements**: ESP32-S3 with PSRAM (octal mode recommended)
 
 ## Auto Hangup Feature (Xiaozhi only)
 
@@ -504,9 +534,10 @@ esphome-intercom/
     │   ├── __init__.py
     │   ├── mdns_discovery.h
     │   └── mdns_discovery.cpp
-    └── esp_aec/               # Echo cancellation (optional)
+    └── esp_aec/               # Echo cancellation (optional, requires ESP-SR)
         ├── __init__.py
-        └── esp_aec.h
+        ├── esp_aec.h
+        └── esp_aec.cpp
 ```
 
 > **Note**: The example YAML files (`intercom.yaml` and `intercom_mini.yaml`) are **real, tested configurations** used daily by the project maintainer. They include comprehensive English documentation explaining each section and can serve as templates for your own builds.
@@ -543,7 +574,15 @@ esphome-intercom/
 
 ## Changelog
 
-### Version 4.1 (Current)
+### Version 4.2 (Current)
+- **NEW**: Echo Cancellation toggle switch in Home Assistant
+- **FIX**: Socket initialization failure (errno 23) - increased `CONFIG_LWIP_MAX_SOCKETS` to 16
+- **FIX**: AEC crash due to stack overflow - increased `TASK_STACK_SIZE` to 8192
+- **IMPROVED**: Examples aligned with current component structure
+- **IMPROVED**: Documentation for AEC configuration
+- **NEW**: P2P fallback automation example for Home Assistant
+
+### Version 4.1
 - **IMPROVED**: Replaced custom jitter buffer with ESPHome's native `RingBuffer` class
 - **IMPROVED**: Optimized FreeRTOS task parameters (stack 4096, priority 19)
 - **IMPROVED**: Cleaner logging levels (reduced verbosity, proper ESP_LOGD/LOGI usage)
@@ -576,7 +615,7 @@ esphome-intercom/
 - **IMPROVED**: Automatic peer switching when selected peer disconnects
 
 ### Version 2.0
-- **NEW**: Echo Cancellation (ESP-AFE AEC) with toggle switch
+- **NEW**: Echo Cancellation (ESP-SR AEC) with toggle switch
 - **NEW**: Improved volume curve (usable across full range)
 - **IMPROVED**: Streaming restart stability
 - **IMPROVED**: Socket handling with proper cleanup
@@ -643,7 +682,7 @@ MIT License - Feel free to use, modify, and distribute!
 
 - **Created by**: Claude (Anthropic) for n-IA-hane
 - **Tested on**: Xiaozhi Ball V3, ESP32-S3 Mini (but works with any ESP32 + I2S)
-- **Frameworks**: ESPHome, Home Assistant, go2rtc, WebRTC, ESP-AFE
+- **Frameworks**: ESPHome, Home Assistant, go2rtc, WebRTC, ESP-SR
 - **Inspiration**: The need for a simple, working intercom solution
 
 ---

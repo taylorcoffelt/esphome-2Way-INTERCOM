@@ -11,7 +11,7 @@ from esphome.const import CONF_ID
 
 CODEOWNERS = ["@n-IA-hane"]
 DEPENDENCIES = ["network"]
-AUTO_LOAD = ["sensor", "text_sensor", "number"]
+AUTO_LOAD = ["sensor", "text_sensor", "number", "switch"]
 
 # Pin configuration - Single bus (ES8311)
 CONF_I2S_LRCLK_PIN = "i2s_lrclk_pin"

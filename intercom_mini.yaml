@@ -76,6 +76,10 @@ esp32:
       CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_LWIP_MAX_SOCKETS: "16"
+    # ESP-SR for AEC (Acoustic Echo Cancellation)
+    components:
+      - espressif/esp-sr^2.3.0
 
 # PSRAM configuration for audio buffers
 psram:
@@ -131,6 +135,7 @@ external_components:
   - source:
       type: local
       path: custom_components
+    components: [i2s_audio_udp, mdns_discovery, esp_aec]
 
 # ==============================================================================
 # mDNS DISCOVERY COMPONENT
@@ -249,6 +254,15 @@ udp:
           id(audio_component).start();
 
 # ==============================================================================
+# ECHO CANCELLATION (ESP-SR AFE)
+# Removes speaker audio from microphone input for cleaner calls
+# ==============================================================================
+esp_aec:
+  id: echo_canceller
+  sample_rate: 16000
+  filter_length: 4  # 1-10, higher = better cancellation but more CPU
+
+# ==============================================================================
 # I2S AUDIO UDP COMPONENT
 # Core audio streaming bridge: I2S hardware <-> UDP network
 # Uses dual I2S bus configuration for separate mic and speaker hardware
@@ -279,6 +293,9 @@ i2s_audio_udp:
   remote_ip: !lambda 'return id(target_peer_ip).state;'
   remote_port: !lambda 'return (uint16_t)id(target_peer_port).state;'
   listen_port: ${p2p_port}
+
+  # Echo Cancellation - links to esp_aec component for real-time echo removal
+  aec_id: echo_canceller
 
   # Callback when streaming starts
   on_start:
@@ -518,6 +535,13 @@ switch:
       - i2s_audio_udp.stop:
           id: audio_component
     lambda: return id(audio_component).is_streaming();
+
+  # Echo Cancellation toggle (requires esp_aec component and ESP-SR)
+  - platform: i2s_audio_udp
+    i2s_audio_udp_id: audio_component
+    aec:
+      name: "Echo Cancellation"
+      id: aec_switch
 
 # ==============================================================================
 # NUMBER ENTITIES

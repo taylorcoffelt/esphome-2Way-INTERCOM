@@ -26,7 +26,7 @@ static const size_t DMA_BUFFER_SIZE = 512;
 static const size_t RING_BUFFER_SIZE = 8192;
 
 // FreeRTOS task parameters
-static const size_t TASK_STACK_SIZE = 4096;
+static const size_t TASK_STACK_SIZE = 8192;  // Increased for AEC processing
 static const ssize_t TASK_PRIORITY = 19;
 
 void I2SAudioUDP::setup() {
@@ -430,6 +430,7 @@ void I2SAudioUDP::audio_task(void *params) {
   int16_t *last_speaker = nullptr;
 
 #ifdef USE_ESP_AEC
+  // Allocate AEC buffers only if AEC is present - they're used based on aec_enabled_ at runtime
   if (self->aec_ != nullptr && self->aec_->is_initialized() && has_tx && has_rx) {
     aec_output = (int16_t *)heap_caps_aligned_alloc(16, frame_bytes, MALLOC_CAP_INTERNAL);
     last_speaker = (int16_t *)heap_caps_aligned_alloc(16, frame_bytes, MALLOC_CAP_INTERNAL);
@@ -538,7 +539,9 @@ void I2SAudioUDP::audio_task(void *params) {
         int16_t *send_buffer = mic_buffer;
 
 #ifdef USE_ESP_AEC
-        if (self->aec_ != nullptr && self->aec_->is_initialized() && aec_output && last_speaker) {
+        // Apply AEC only if enabled at runtime
+        if (self->aec_ != nullptr && self->aec_->is_initialized() &&
+            self->aec_enabled_ && aec_output && last_speaker) {
           self->aec_->process(mic_buffer, last_speaker, aec_output, frame_size);
           send_buffer = aec_output;
         }

@@ -64,14 +64,14 @@ mdns:
 external_components:
   - source:
       type: local
-      path: custom_components
+      path: ../custom_components
 
 # =============================================================================
 # mDNS DISCOVERY
 # =============================================================================
 mdns_discovery:
   id: discovery_component
-  service_type: "_udp-intercom._udp"
+  service_type: "udp-intercom"
   scan_interval: 30s
   on_peer_found:
     - logger.log:

@@ -1,0 +1,151 @@
+# =============================================================================
+# Home Assistant Automation: P2P Fallback when HA doesn't respond
+# =============================================================================
+#
+# Use case:
+# - Doorbell rings at the front door
+# - HA sends notification to your phone
+# - If no one answers within 30 seconds, automatically fall back to P2P
+#   and ring the kitchen intercom directly
+#
+# This ensures you never miss a doorbell even if you're away from your phone!
+#
+# Add this to your Home Assistant automations.yaml
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Automation 1: Start the countdown when doorbell rings
+# -----------------------------------------------------------------------------
+- alias: "Intercom - Doorbell Ring Start"
+  id: intercom_doorbell_ring_start
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.intercom_doorbell_button
+      to: "on"
+  condition:
+    # Only trigger if not already streaming
+    - condition: state
+      entity_id: switch.intercom_streaming
+      state: "off"
+  action:
+    # Send notification
+    - service: notify.mobile_app_your_phone  # Change to your device
+      data:
+        title: "Doorbell"
+        message: "Someone is at the door!"
+        data:
+          tag: "doorbell"
+          actions:
+            - action: "ANSWER_INTERCOM"
+              title: "Answer"
+            - action: "IGNORE_INTERCOM"
+              title: "Ignore"
+
+    # Start a 30-second timer for P2P fallback
+    - service: timer.start
+      target:
+        entity_id: timer.intercom_p2p_fallback
+      data:
+        duration: "00:00:30"
+
+# -----------------------------------------------------------------------------
+# Automation 2: User answered from phone - cancel fallback
+# -----------------------------------------------------------------------------
+- alias: "Intercom - User Answered"
+  id: intercom_user_answered
+  trigger:
+    # Triggered when user taps "Answer" on notification
+    - platform: event
+      event_type: mobile_app_notification_action
+      event_data:
+        action: "ANSWER_INTERCOM"
+    # Or when streaming starts via any method
+    - platform: state
+      entity_id: switch.intercom_streaming
+      to: "on"
+  action:
+    # Cancel the P2P fallback timer
+    - service: timer.cancel
+      target:
+        entity_id: timer.intercom_p2p_fallback
+
+    # Set to go2rtc mode if answered via notification
+    - choose:
+        - conditions:
+            - condition: trigger
+              id: "0"  # mobile_app_notification_action
+          sequence:
+            - service: select.select_option
+              target:
+                entity_id: select.intercom_operating_mode
+              data:
+                option: "go2rtc"
+            - service: switch.turn_on
+              target:
+                entity_id: switch.intercom_streaming
+
+# -----------------------------------------------------------------------------
+# Automation 3: Timer expired - fall back to P2P
+# -----------------------------------------------------------------------------
+- alias: "Intercom - P2P Fallback"
+  id: intercom_p2p_fallback
+  trigger:
+    - platform: event
+      event_type: timer.finished
+      event_data:
+        entity_id: timer.intercom_p2p_fallback
+  action:
+    # Switch to P2P mode
+    - service: select.select_option
+      target:
+        entity_id: select.intercom_operating_mode
+      data:
+        option: "P2P Auto Answer"
+
+    # Set target to the kitchen intercom (adjust IP for your setup)
+    - service: text.set_value
+      target:
+        entity_id: text.intercom_target_ip
+      data:
+        value: "192.168.1.18"  # Kitchen intercom IP
+
+    # Start streaming - this will trigger the kitchen intercom
+    - service: switch.turn_on
+      target:
+        entity_id: switch.intercom_streaming
+
+    # Optional: Announce on kitchen intercom that it's a doorbell fallback
+    - service: notify.mobile_app_your_phone
+      data:
+        title: "Intercom"
+        message: "No answer - falling back to kitchen intercom"
+
+# -----------------------------------------------------------------------------
+# Automation 4: Auto-hangup after call ends
+# -----------------------------------------------------------------------------
+- alias: "Intercom - Auto Hangup"
+  id: intercom_auto_hangup
+  trigger:
+    - platform: state
+      entity_id: switch.intercom_streaming
+      to: "off"
+  action:
+    # Reset to preferred default mode
+    - service: select.select_option
+      target:
+        entity_id: select.intercom_operating_mode
+      data:
+        option: "go2rtc"
+
+# =============================================================================
+# Required Helper: Timer for P2P fallback
+# =============================================================================
+# Add this to your configuration.yaml under 'timer:':
+#
+# timer:
+#   intercom_p2p_fallback:
+#     name: "Intercom P2P Fallback Timer"
+#     duration: "00:00:30"
+#     icon: mdi:timer-sand
+#
+# =============================================================================

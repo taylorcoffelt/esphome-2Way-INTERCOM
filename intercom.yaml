@@ -82,9 +82,10 @@ esp32:
       CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
-    # ESP-AEC requires ESP-SR component (installation pending)
-    # components:
-    #   - espressif/esp-sr^2.3.0
+      CONFIG_LWIP_MAX_SOCKETS: "16"
+    # ESP-SR for AEC (Acoustic Echo Cancellation)
+    components:
+      - espressif/esp-sr^2.3.0
 
 # PSRAM configuration for audio buffers
 psram:
@@ -157,9 +158,12 @@ external_components:
       type: local
       path: custom_components
 
-# Echo cancellation (disabled pending ESP-SR installation)
-# esp_aec:
-#   id: aec_component
+# Echo Cancellation (ESP-SR AFE)
+# Removes echo from microphone input using speaker playback as reference
+esp_aec:
+  id: aec_component
+  sample_rate: 16000
+  filter_length: 4  # 1-10, higher = better cancellation but more CPU
 
 # ==============================================================================
 # mDNS DISCOVERY COMPONENT
@@ -291,8 +295,8 @@ i2s_audio_udp:
   remote_port: !lambda 'return (uint16_t)id(target_peer_port).state;'
   listen_port: ${p2p_port}
 
-  # Echo cancellation (disabled pending ESP-SR installation)
-  # aec_id: aec_component
+  # Echo Cancellation - links to esp_aec component for real-time echo removal
+  aec_id: aec_component
 
   # Callback when streaming starts
   on_start:
@@ -572,10 +576,12 @@ switch:
           id: audio_component
     lambda: return id(audio_component).is_streaming();
 
-# Echo cancellation switch (disabled pending ESP-SR installation)
-#  - platform: template
-#    name: "Echo Cancellation"
-#    id: aec_switch;
+  # Echo Cancellation toggle (requires esp_aec component and ESP-SR)
+  - platform: i2s_audio_udp
+    i2s_audio_udp_id: audio_component
+    aec:
+      name: "Echo Cancellation"
+      id: aec_switch
 
 # ==============================================================================
 # SELECT ENTITIES

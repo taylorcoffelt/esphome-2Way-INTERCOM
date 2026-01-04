@@ -19,6 +19,9 @@ esp32:
     sdkconfig_options:
       CONFIG_SPIRAM_MODE_OCT: y
       CONFIG_SPIRAM_SPEED_80M: y
+    # Required for AEC
+    components:
+      - espressif/esp-sr^2.3.0
 
 psram:
   mode: octal
