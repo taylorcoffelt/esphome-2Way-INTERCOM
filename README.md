@@ -52,7 +52,7 @@ https://github.com/n-IA-hane/esphome-intercom/raw/master/readme_img/call.mp4
 - **Home Assistant Integration**: Full control from HA dashboards and Companion app
 - **Volume Control**: Adjustable speaker volume (hardware or software)
 
-### P2P Mode (NEW in v3.0!)
+### P2P Mode
 - **Direct Device-to-Device**: No server required - ESP devices talk directly to each other
 - **mDNS Discovery**: Automatic peer discovery on local network
 - **Auto-Answer**: Hands-free operation for secondary units
