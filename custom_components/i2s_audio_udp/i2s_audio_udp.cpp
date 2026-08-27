@@ -3,6 +3,7 @@
 #include "esphome/core/application.h"
 
 #include <cstring>
+#include <cmath>
 #include <algorithm>
 #include <errno.h>
 #include <driver/gpio.h>
@@ -23,11 +24,19 @@ static const char *TAG = "i2s_audio_udp";
 static const size_t AUDIO_BUFFER_SIZE = 1024;
 static const size_t DMA_BUFFER_COUNT = 8;
 static const size_t DMA_BUFFER_SIZE = 512;
-static const size_t RING_BUFFER_SIZE = 8192;
+
+// Sized to hold well over the prebuffer plus a burst. DMA alone can absorb
+// DMA_BUFFER_COUNT * DMA_BUFFER_SIZE frames (8192 bytes at 16-bit mono), so a
+// ring anywhere near that leaves no cushion at all.
+static const size_t RING_BUFFER_SIZE = 32768;
 
 // FreeRTOS task parameters
 static const size_t TASK_STACK_SIZE = 8192;  // Increased for AEC processing
 static const ssize_t TASK_PRIORITY = 19;
+
+// Local rather than M_PI: math.h exposes it inconsistently across toolchains
+// and this needs no more precision than float carries.
+static const float TWO_PI_F = 6.28318530718f;
 
 void I2SAudioUDP::setup() {
   ESP_LOGD(TAG, "Setting up...");
@@ -113,6 +122,90 @@ void I2SAudioUDP::apply_software_volume_(int16_t *buffer, size_t samples) {
     sample = (int32_t)(sample * this->volume_);
     buffer[i] = (int16_t)std::clamp(sample, (int32_t)-32768, (int32_t)32767);
   }
+}
+
+void I2SAudioUDP::play_tone(uint32_t freq_hz, uint32_t duration_ms, float amplitude) {
+  if (this->audio_mode_ == AUDIO_MODE_TX_ONLY) {
+    ESP_LOGW(TAG, "play_tone: no speaker configured (TX_ONLY)");
+    return;
+  }
+  if (duration_ms == 0 || freq_hz == 0)
+    return;
+  if (duration_ms > 5000)
+    duration_ms = 5000;
+  amplitude = std::clamp(amplitude, 0.0f, 1.0f);
+
+  const uint32_t rate = this->sample_rate_;
+  const size_t total = (size_t)((uint64_t)duration_ms * rate / 1000ULL);
+  if (total == 0)
+    return;
+  // 5ms of linear ramp at each end. A tone that starts at full amplitude on a
+  // zero crossing still steps the amplifier hard enough to click.
+  const size_t ramp = std::min<size_t>(total / 2, rate / 200);
+
+  const bool streaming = this->streaming_;
+  bool temp_i2s = false;
+
+  if (streaming) {
+    // The audio task owns the I2S channel while streaming, so hand the tone to
+    // it the same way the network does rather than writing concurrently.
+    if (this->audio_ring_buffer_ == nullptr) {
+      ESP_LOGW(TAG, "play_tone: no ring buffer");
+      return;
+    }
+  } else if (this->tx_handle_ == nullptr) {
+    const bool ok = (this->bus_mode_ == I2S_BUS_SINGLE) ? this->init_i2s_single_bus_()
+                                                        : this->init_i2s_dual_bus_();
+    if (!ok) {
+      ESP_LOGE(TAG, "play_tone: could not bring I2S up");
+      return;
+    }
+    temp_i2s = true;
+  }
+
+  static const size_t CHUNK = 256;
+  int16_t chunk[CHUNK];
+  const float step = TWO_PI_F * (float)freq_hz / (float)rate;
+  float phase = 0.0f;
+  size_t done = 0;
+
+  while (done < total) {
+    const size_t n = std::min(CHUNK, total - done);
+    for (size_t i = 0; i < n; i++) {
+      const size_t idx = done + i;
+      float env = 1.0f;
+      if (ramp > 0) {
+        if (idx < ramp) {
+          env = (float)idx / (float)ramp;
+        } else if (idx >= total - ramp) {
+          env = (float)(total - idx) / (float)ramp;
+        }
+      }
+      chunk[i] = (int16_t)(sinf(phase) * amplitude * env * 32767.0f);
+      phase += step;
+      if (phase > TWO_PI_F)
+        phase -= TWO_PI_F;
+    }
+
+    if (streaming) {
+      this->audio_ring_buffer_->write((void *)chunk, n * sizeof(int16_t));
+    } else {
+      size_t written = 0;
+      i2s_channel_write(this->tx_handle_, chunk, n * sizeof(int16_t), &written,
+                        pdMS_TO_TICKS(200));
+    }
+    done += n;
+  }
+
+  if (temp_i2s) {
+    // i2s_channel_write returns once the data is queued, not once it has been
+    // clocked out. Tearing the channel down immediately truncates the tail.
+    vTaskDelay(pdMS_TO_TICKS(120));
+    this->deinit_i2s_();
+  }
+
+  ESP_LOGI(TAG, "play_tone: %u Hz for %u ms at %.0f%%", (unsigned)freq_hz,
+           (unsigned)duration_ms, amplitude * 100.0f);
 }
 
 bool I2SAudioUDP::init_i2s_single_bus_() {
@@ -449,9 +542,20 @@ void I2SAudioUDP::audio_task(void *params) {
     return;
   }
 
-  const size_t PREBUFFER_THRESHOLD = 2048;
-  bool prebuffering = true;
+  // Must exceed what the I2S DMA ring can absorb in one go
+  // (DMA_BUFFER_COUNT * DMA_BUFFER_SIZE frames = 8192 bytes at 16-bit mono).
+  // i2s_channel_write does not block until DMA is full, so a prebuffer smaller
+  // than that is drained instantly on the very first pass and playback can
+  // never reach steady state. 12288 bytes is 384ms at 16kHz mono.
+  const size_t PREBUFFER_THRESHOLD = 12288;
 
+  // How long the ring may stay empty before it counts as a real underrun. DMA
+  // still holds up to 256ms of already-queued audio and keeps playing, so
+  // treating the first empty pass as an underrun is what creates the gap.
+  static const uint32_t UNDERRUN_GRACE_MS = 250;
+
+  bool prebuffering = true;
+  uint32_t last_frame_ms = millis();
   uint32_t last_stats_log = 0;
 
   while (self->streaming_) {
@@ -490,6 +594,7 @@ void I2SAudioUDP::audio_task(void *params) {
       if (prebuffering) {
         if (available >= PREBUFFER_THRESHOLD) {
           prebuffering = false;
+          last_frame_ms = millis();
           ESP_LOGD(TAG, "Prebuffer complete, starting playback");
         }
       }
@@ -499,6 +604,7 @@ void I2SAudioUDP::audio_task(void *params) {
         if (got == frame_bytes) {
           self->apply_software_volume_(spk_buffer, frame_size);
           i2s_channel_write(self->tx_handle_, spk_buffer, frame_bytes, &bytes_written, pdMS_TO_TICKS(50));
+          last_frame_ms = millis();
           did_work = true;
 
 #ifdef USE_ESP_AEC
@@ -508,8 +614,12 @@ void I2SAudioUDP::audio_task(void *params) {
 #endif
         }
       } else if (!prebuffering && available == 0) {
-        prebuffering = true;
-        ESP_LOGW(TAG, "Buffer underrun, rebuffering...");
+        // Momentarily empty is normal - DMA is still playing. Only a sustained
+        // drought means the source has actually stopped.
+        if (millis() - last_frame_ms > UNDERRUN_GRACE_MS) {
+          prebuffering = true;
+          ESP_LOGW(TAG, "Buffer underrun, rebuffering...");
+        }
       }
     }
 
@@ -613,6 +723,12 @@ void I2SAudioUDP::start() {
   }
 
   ESP_LOGI(TAG, "Starting audio streaming...");
+
+  // A play_tone() while idle may have left a channel open; start from a known
+  // state rather than trying to reuse it.
+  if (this->tx_handle_ != nullptr || this->rx_handle_ != nullptr) {
+    this->deinit_i2s_();
+  }
 
   // Initialize I2S
   bool i2s_ok = false;
