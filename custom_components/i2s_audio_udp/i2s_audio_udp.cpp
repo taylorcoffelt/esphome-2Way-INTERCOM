@@ -455,6 +455,12 @@ void I2SAudioUDP::audio_task(void *params) {
   uint32_t last_stats_log = 0;
 
   while (self->streaming_) {
+    // Set whenever this pass actually moved audio. Every blocking call in this
+    // loop (i2s_channel_write / i2s_channel_read) sits behind a data-available
+    // check, so a pass that moves nothing never blocks - see the yield at the
+    // bottom of the loop.
+    bool did_work = false;
+
     // ═══════════════════════════════════════════════════════════════════════
     // UDP -> JITTER BUFFER (receive audio from network)
     // ═══════════════════════════════════════════════════════════════════════
@@ -465,6 +471,7 @@ void I2SAudioUDP::audio_task(void *params) {
         if (received > 0) {
           self->rx_packets_++;
           self->audio_ring_buffer_->write((void*)udp_buffer, received);
+          did_work = true;
         } else if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
           break;
         } else {
@@ -492,6 +499,7 @@ void I2SAudioUDP::audio_task(void *params) {
         if (got == frame_bytes) {
           self->apply_software_volume_(spk_buffer, frame_size);
           i2s_channel_write(self->tx_handle_, spk_buffer, frame_bytes, &bytes_written, pdMS_TO_TICKS(50));
+          did_work = true;
 
 #ifdef USE_ESP_AEC
           if (last_speaker) {
@@ -536,6 +544,10 @@ void I2SAudioUDP::audio_task(void *params) {
       }
 
       if (err == ESP_OK && bytes_read == frame_bytes) {
+        // A successful I2S read is itself a blocking, sample-paced operation,
+        // so the loop is self-throttling whenever a mic is present.
+        did_work = true;
+
         int16_t *send_buffer = mic_buffer;
 
 #ifdef USE_ESP_AEC
@@ -563,6 +575,22 @@ void I2SAudioUDP::audio_task(void *params) {
       ESP_LOGD(TAG, "Stats: TX=%u RX=%u buf=%d", self->tx_packets_, self->rx_packets_,
                self->audio_ring_buffer_->available());
       last_stats_log = now;
+    }
+
+    // Nothing moved this pass, which means nothing above blocked either: the
+    // receive socket is O_NONBLOCK, playback is skipped while prebuffering,
+    // and in RX_ONLY mode the mic branch does not run at all. Without an
+    // explicit sleep this loop busy-waits at TASK_PRIORITY (19) pinned to a
+    // core, starving that core's idle task, and the task watchdog panics the
+    // device - which is exactly what happens to an RX_ONLY receiver that is
+    // enabled before its sender starts.
+    //
+    // vTaskDelay(1) and not pdMS_TO_TICKS(n): at the default 100 Hz tick,
+    // pdMS_TO_TICKS of anything under 10 ms truncates to 0, and vTaskDelay(0)
+    // only yields to tasks of equal priority - a priority-0 idle task would
+    // still never run. One tick is the smallest delay that actually blocks.
+    if (!did_work) {
+      vTaskDelay(1);
     }
   }
 
