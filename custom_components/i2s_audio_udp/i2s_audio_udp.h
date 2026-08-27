@@ -106,6 +106,23 @@ class I2SAudioUDP : public Component {
   void stop();
   bool is_streaming() const { return this->streaming_; }
 
+  // Play a sine tone through the speaker path.
+  //
+  // Exists to answer "is the codec, amplifier and speaker chain alive?" without
+  // involving the network at all - otherwise silence has two possible causes
+  // and no way to tell them apart.
+  //
+  // While streaming, the tone goes to the audio task through the same ring
+  // buffer the network feeds. While idle, I2S is brought up for the duration
+  // and torn down again, so this works with the receiver stopped; in that case
+  // the call blocks for roughly duration_ms.
+  //
+  // amplitude is 0..1 of full scale and is deliberately independent of
+  // set_volume(): a test that is silent because the volume slider happens to be
+  // down has tested nothing. The codec's own output level still applies. The
+  // tone is ramped in and out over 5ms so the amplifier does not pop.
+  void play_tone(uint32_t freq_hz, uint32_t duration_ms, float amplitude = 0.25f);
+
   // ─────────────────────────────────────────────────────────────────────────
   // Volume Control
   // ─────────────────────────────────────────────────────────────────────────
