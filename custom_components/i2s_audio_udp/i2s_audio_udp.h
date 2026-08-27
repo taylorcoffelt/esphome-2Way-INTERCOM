@@ -154,6 +154,13 @@ class I2SAudioUDP : public Component {
   void close_sockets_();
   void apply_software_volume_(int16_t *buffer, size_t samples);
 
+  // True when the speaker channel carries two slots per frame, so a mono
+  // source has to be duplicated across both before it is written. The
+  // single-bus (ES8311) path needs this: with no MCLK the codec derives its
+  // clocks from BCLK and only accepts standard BCLK/rate ratios, and one
+  // 16-bit slot per frame is not one of them.
+  bool speaker_is_stereo_() const;
+
   static void audio_task(void *params);
 
   // Pin configuration - Single bus
