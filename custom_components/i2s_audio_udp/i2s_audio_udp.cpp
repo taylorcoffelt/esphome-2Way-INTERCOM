@@ -26,8 +26,8 @@ static const size_t DMA_BUFFER_COUNT = 8;
 static const size_t DMA_BUFFER_SIZE = 512;
 
 // Sized to hold well over the prebuffer plus a burst. DMA alone can absorb
-// DMA_BUFFER_COUNT * DMA_BUFFER_SIZE frames (8192 bytes at 16-bit mono), so a
-// ring anywhere near that leaves no cushion at all.
+// DMA_BUFFER_COUNT * DMA_BUFFER_SIZE frames, so a ring anywhere near that
+// leaves no cushion at all.
 static const size_t RING_BUFFER_SIZE = 32768;
 
 // FreeRTOS task parameters
@@ -61,6 +61,9 @@ void I2SAudioUDP::dump_config() {
   ESP_LOGCONFIG(TAG, "  Bus Mode: %s", this->bus_mode_ == I2S_BUS_SINGLE ? "SINGLE" : "DUAL");
   ESP_LOGCONFIG(TAG, "  Audio Mode: %s", this->get_audio_mode_text());
   ESP_LOGCONFIG(TAG, "  Sample Rate: %d Hz", this->sample_rate_);
+  if (this->bus_mode_ == I2S_BUS_SINGLE) {
+    ESP_LOGCONFIG(TAG, "  Slots: stereo (mono duplicated); BCLK = 32x rate");
+  }
   if (this->bus_mode_ == I2S_BUS_DUAL) {
     ESP_LOGCONFIG(TAG, "  Mic Config: %d-bit, channel=%s, gain=%dx",
                   this->mic_bits_per_sample_,
@@ -124,6 +127,12 @@ void I2SAudioUDP::apply_software_volume_(int16_t *buffer, size_t samples) {
   }
 }
 
+// True when the I2S channel is carrying two slots per frame and a mono source
+// therefore has to be duplicated across both before it is written.
+bool I2SAudioUDP::speaker_is_stereo_() const {
+  return this->bus_mode_ == I2S_BUS_SINGLE;
+}
+
 void I2SAudioUDP::play_tone(uint32_t freq_hz, uint32_t duration_ms, float amplitude) {
   if (this->audio_mode_ == AUDIO_MODE_TX_ONLY) {
     ESP_LOGW(TAG, "play_tone: no speaker configured (TX_ONLY)");
@@ -163,8 +172,10 @@ void I2SAudioUDP::play_tone(uint32_t freq_hz, uint32_t duration_ms, float amplit
     temp_i2s = true;
   }
 
+  const bool stereo = this->speaker_is_stereo_();
   static const size_t CHUNK = 256;
-  int16_t chunk[CHUNK];
+  int16_t mono[CHUNK];
+  int16_t wide[CHUNK * 2];
   const float step = TWO_PI_F * (float)freq_hz / (float)rate;
   float phase = 0.0f;
   size_t done = 0;
@@ -181,18 +192,28 @@ void I2SAudioUDP::play_tone(uint32_t freq_hz, uint32_t duration_ms, float amplit
           env = (float)(total - idx) / (float)ramp;
         }
       }
-      chunk[i] = (int16_t)(sinf(phase) * amplitude * env * 32767.0f);
+      mono[i] = (int16_t)(sinf(phase) * amplitude * env * 32767.0f);
       phase += step;
       if (phase > TWO_PI_F)
         phase -= TWO_PI_F;
     }
 
     if (streaming) {
-      this->audio_ring_buffer_->write((void *)chunk, n * sizeof(int16_t));
+      // The ring buffer is mono end to end; the playback path widens it.
+      this->audio_ring_buffer_->write((void *)mono, n * sizeof(int16_t));
     } else {
       size_t written = 0;
-      i2s_channel_write(this->tx_handle_, chunk, n * sizeof(int16_t), &written,
-                        pdMS_TO_TICKS(200));
+      if (stereo) {
+        for (size_t i = 0; i < n; i++) {
+          wide[2 * i] = mono[i];
+          wide[2 * i + 1] = mono[i];
+        }
+        i2s_channel_write(this->tx_handle_, wide, n * 2 * sizeof(int16_t), &written,
+                          pdMS_TO_TICKS(200));
+      } else {
+        i2s_channel_write(this->tx_handle_, mono, n * sizeof(int16_t), &written,
+                          pdMS_TO_TICKS(200));
+      }
     }
     done += n;
   }
@@ -232,13 +253,18 @@ bool I2SAudioUDP::init_i2s_single_bus_() {
     return false;
   }
 
+  // STEREO, not MONO. A codec with no MCLK wire derives its internal clocks
+  // from BCLK and only accepts standard BCLK/sample-rate ratios; one 16-bit
+  // slot per frame is a ratio of 16, which is not one of them, and the codec
+  // driver rejects the configuration. Two slots is 32, which is. Mono sources
+  // are duplicated across both slots at write time.
   i2s_std_config_t std_cfg = {
     .clk_cfg = {
       .sample_rate_hz = this->sample_rate_,
       .clk_src = I2S_CLK_SRC_DEFAULT,
       .mclk_multiple = I2S_MCLK_MULTIPLE_256,
     },
-    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
     .gpio_cfg = {
       .mclk = (gpio_num_t)this->i2s_mclk_pin_,
       .bclk = (gpio_num_t)this->i2s_bclk_pin_,
@@ -248,8 +274,6 @@ bool I2SAudioUDP::init_i2s_single_bus_() {
       .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
     },
   };
-
-  std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
 
   if (need_tx) {
     err = i2s_channel_init_std_mode(this->tx_handle_, &std_cfg);
@@ -269,7 +293,7 @@ bool I2SAudioUDP::init_i2s_single_bus_() {
     i2s_channel_enable(this->rx_handle_);
   }
 
-  ESP_LOGD(TAG, "I2S Single Bus initialized");
+  ESP_LOGD(TAG, "I2S Single Bus initialized (stereo slots)");
   return true;
 }
 
@@ -508,6 +532,7 @@ void I2SAudioUDP::audio_task(void *params) {
   bool is_dual_bus = (self->bus_mode_ == I2S_BUS_DUAL);
   bool has_tx = (self->audio_mode_ == AUDIO_MODE_TX_ONLY || self->audio_mode_ == AUDIO_MODE_FULL_DUPLEX);
   bool has_rx = (self->audio_mode_ == AUDIO_MODE_RX_ONLY || self->audio_mode_ == AUDIO_MODE_FULL_DUPLEX);
+  const bool spk_stereo = self->speaker_is_stereo_();
 
   size_t mic_read_bytes = is_dual_bus && (self->mic_bits_per_sample_ == 32) ?
       (frame_size * sizeof(int32_t)) : frame_bytes;
@@ -519,6 +544,10 @@ void I2SAudioUDP::audio_task(void *params) {
       (int32_t *)heap_caps_aligned_alloc(16, mic_read_bytes, MALLOC_CAP_INTERNAL) : nullptr;
   int16_t *spk_buffer = has_rx ?
       (int16_t *)heap_caps_aligned_alloc(16, frame_bytes, MALLOC_CAP_INTERNAL) : nullptr;
+  // Widened copy for stereo-slot output. The ring buffer and everything
+  // upstream of it stay mono; only the final write doubles.
+  int16_t *spk_wide = (has_rx && spk_stereo) ?
+      (int16_t *)heap_caps_aligned_alloc(16, frame_bytes * 2, MALLOC_CAP_INTERNAL) : nullptr;
   int16_t *aec_output = nullptr;
   int16_t *last_speaker = nullptr;
 
@@ -542,16 +571,15 @@ void I2SAudioUDP::audio_task(void *params) {
     return;
   }
 
-  // Must exceed what the I2S DMA ring can absorb in one go
-  // (DMA_BUFFER_COUNT * DMA_BUFFER_SIZE frames = 8192 bytes at 16-bit mono).
-  // i2s_channel_write does not block until DMA is full, so a prebuffer smaller
-  // than that is drained instantly on the very first pass and playback can
-  // never reach steady state. 12288 bytes is 384ms at 16kHz mono.
+  // Must exceed what the I2S DMA ring can absorb in one go. i2s_channel_write
+  // does not block until DMA is full, so a prebuffer smaller than that is
+  // drained instantly on the first pass and playback never reaches steady
+  // state. 12288 bytes is 384ms at 16kHz mono.
   const size_t PREBUFFER_THRESHOLD = 12288;
 
   // How long the ring may stay empty before it counts as a real underrun. DMA
-  // still holds up to 256ms of already-queued audio and keeps playing, so
-  // treating the first empty pass as an underrun is what creates the gap.
+  // still holds already-queued audio and keeps playing, so treating the first
+  // empty pass as an underrun is what creates the gap.
   static const uint32_t UNDERRUN_GRACE_MS = 250;
 
   bool prebuffering = true;
@@ -560,9 +588,8 @@ void I2SAudioUDP::audio_task(void *params) {
 
   while (self->streaming_) {
     // Set whenever this pass actually moved audio. Every blocking call in this
-    // loop (i2s_channel_write / i2s_channel_read) sits behind a data-available
-    // check, so a pass that moves nothing never blocks - see the yield at the
-    // bottom of the loop.
+    // loop sits behind a data-available check, so a pass that moves nothing
+    // never blocks - see the yield at the bottom of the loop.
     bool did_work = false;
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -603,7 +630,19 @@ void I2SAudioUDP::audio_task(void *params) {
         size_t got = self->audio_ring_buffer_->read((void*)spk_buffer, frame_bytes, 0);
         if (got == frame_bytes) {
           self->apply_software_volume_(spk_buffer, frame_size);
-          i2s_channel_write(self->tx_handle_, spk_buffer, frame_bytes, &bytes_written, pdMS_TO_TICKS(50));
+
+          if (spk_stereo && spk_wide) {
+            for (int i = 0; i < frame_size; i++) {
+              spk_wide[2 * i] = spk_buffer[i];
+              spk_wide[2 * i + 1] = spk_buffer[i];
+            }
+            i2s_channel_write(self->tx_handle_, spk_wide, frame_bytes * 2, &bytes_written,
+                              pdMS_TO_TICKS(50));
+          } else {
+            i2s_channel_write(self->tx_handle_, spk_buffer, frame_bytes, &bytes_written,
+                              pdMS_TO_TICKS(50));
+          }
+
           last_frame_ms = millis();
           did_work = true;
 
@@ -661,7 +700,6 @@ void I2SAudioUDP::audio_task(void *params) {
         int16_t *send_buffer = mic_buffer;
 
 #ifdef USE_ESP_AEC
-        // Apply AEC only if enabled at runtime
         if (self->aec_ != nullptr && self->aec_->is_initialized() &&
             self->aec_enabled_ && aec_output && last_speaker) {
           self->aec_->process(mic_buffer, last_speaker, aec_output, frame_size);
@@ -687,18 +725,15 @@ void I2SAudioUDP::audio_task(void *params) {
       last_stats_log = now;
     }
 
-    // Nothing moved this pass, which means nothing above blocked either: the
-    // receive socket is O_NONBLOCK, playback is skipped while prebuffering,
-    // and in RX_ONLY mode the mic branch does not run at all. Without an
-    // explicit sleep this loop busy-waits at TASK_PRIORITY (19) pinned to a
+    // Nothing moved this pass, which means nothing above blocked either. Without
+    // an explicit sleep this loop busy-waits at TASK_PRIORITY (19) pinned to a
     // core, starving that core's idle task, and the task watchdog panics the
-    // device - which is exactly what happens to an RX_ONLY receiver that is
-    // enabled before its sender starts.
+    // device.
     //
     // vTaskDelay(1) and not pdMS_TO_TICKS(n): at the default 100 Hz tick,
     // pdMS_TO_TICKS of anything under 10 ms truncates to 0, and vTaskDelay(0)
     // only yields to tasks of equal priority - a priority-0 idle task would
-    // still never run. One tick is the smallest delay that actually blocks.
+    // still never run.
     if (!did_work) {
       vTaskDelay(1);
     }
@@ -708,6 +743,7 @@ void I2SAudioUDP::audio_task(void *params) {
   if (mic_buffer) heap_caps_free(mic_buffer);
   if (mic_buffer_32) heap_caps_free(mic_buffer_32);
   if (spk_buffer) heap_caps_free(spk_buffer);
+  if (spk_wide) heap_caps_free(spk_wide);
   if (aec_output) heap_caps_free(aec_output);
   if (last_speaker) heap_caps_free(last_speaker);
   self->audio_ring_buffer_.reset();
