@@ -11,7 +11,11 @@ from esphome.const import CONF_ID
 
 CODEOWNERS = ["@n-IA-hane"]
 DEPENDENCIES = ["network"]
-AUTO_LOAD = ["sensor", "text_sensor", "number", "switch"]
+# ring_buffer: ESPHome 2026.5.0 moved RingBuffer out of esphome/core/ring_buffer.h
+# into its own component, leaving a shim header that #errors unless the component
+# is loaded. i2s_audio_udp.h holds a std::unique_ptr<RingBuffer>, so without this
+# the build fails on 2026.5.0 and later.
+AUTO_LOAD = ["sensor", "text_sensor", "number", "switch", "ring_buffer"]
 
 # Pin configuration - Single bus (ES8311)
 CONF_I2S_LRCLK_PIN = "i2s_lrclk_pin"
