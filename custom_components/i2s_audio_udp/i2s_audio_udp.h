@@ -106,6 +106,40 @@ class I2SAudioUDP : public Component {
   void stop();
   bool is_streaming() const { return this->streaming_; }
 
+  // Bring the I2S channel up, or take it back down, without streaming.
+  //
+  // This exists for amplifier pop suppression. Enabling an amplifier while the
+  // codec's output is unclocked and then starting BCLK/WS makes the amp pass
+  // the resulting step as a loud turn-on thump. The cure is ordering: open the
+  // channel, let the codec settle at digital silence (auto_clear means an idle
+  // enabled channel emits zeros), enable the amp, and only then play. On the
+  // way out, mute the amp before the clocks stop.
+  //
+  // play_tone() cannot do this itself - it owns init and teardown around a
+  // blocking call, leaving no point in the middle for an automation to act -
+  // so the two halves are exposed separately here.
+  //
+  // No-op while streaming: the audio task owns the channel then, and start()
+  // already fires its on_start trigger after I2S is up, so that path is
+  // correctly ordered without help.
+  bool hold_i2s_open(bool open) {
+    if (this->streaming_)
+      return true;
+    if (open) {
+      if (this->tx_handle_ != nullptr)
+        return true;
+      const bool ok = (this->bus_mode_ == I2S_BUS_SINGLE) ? this->init_i2s_single_bus_()
+                                                          : this->init_i2s_dual_bus_();
+      this->i2s_held_open_ = ok;
+      return ok;
+    }
+    if (this->i2s_held_open_) {
+      this->deinit_i2s_();
+      this->i2s_held_open_ = false;
+    }
+    return true;
+  }
+
   // Play a sine tone through the speaker path.
   //
   // Exists to answer "is the codec, amplifier and speaker chain alive?" without
@@ -113,9 +147,10 @@ class I2SAudioUDP : public Component {
   // and no way to tell them apart.
   //
   // While streaming, the tone goes to the audio task through the same ring
-  // buffer the network feeds. While idle, I2S is brought up for the duration
-  // and torn down again, so this works with the receiver stopped; in that case
-  // the call blocks for roughly duration_ms.
+  // buffer the network feeds. While idle it uses the I2S channel directly,
+  // reusing one left open by hold_i2s_open() if there is one, and otherwise
+  // opening and closing its own; in that case the call blocks for roughly
+  // duration_ms.
   //
   // amplitude is 0..1 of full scale and is deliberately independent of
   // set_volume(): a test that is silent because the volume slider happens to be
@@ -206,6 +241,7 @@ class I2SAudioUDP : public Component {
 
   // Runtime state
   volatile bool streaming_{false};
+  bool i2s_held_open_{false};
   i2s_chan_handle_t tx_handle_{nullptr};
   i2s_chan_handle_t rx_handle_{nullptr};
   std::unique_ptr<RingBuffer> audio_ring_buffer_;
