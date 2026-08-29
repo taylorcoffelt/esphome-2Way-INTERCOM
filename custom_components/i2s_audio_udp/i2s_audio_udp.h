@@ -9,6 +9,7 @@
 #include "esphome/components/number/number.h"
 #include "esphome/components/switch/switch.h"
 
+#include <atomic>
 #include <string>
 #include <driver/i2s_std.h>
 #include <freertos/FreeRTOS.h>
@@ -169,6 +170,13 @@ class I2SAudioUDP : public Component {
   // ─────────────────────────────────────────────────────────────────────────
   uint32_t get_tx_packets() const { return this->tx_packets_; }
   uint32_t get_rx_packets() const { return this->rx_packets_; }
+
+  // Recent peak amplitude of what the speaker path is actually playing, 0..1.
+  // The audio task refreshes it per frame with a decay, so a waveform drawn
+  // from it falls back toward zero through silence instead of freezing at the
+  // last loud frame. Reads flat while stopped - nothing is updating it then.
+  float get_peak_level() { return this->streaming_ ? this->peak_level_.load() : 0.0f; }
+
   const char* get_audio_mode_text() const;
   I2SBusMode get_bus_mode() const { return this->bus_mode_; }
   AudioMode get_audio_mode() const { return this->audio_mode_; }
@@ -253,6 +261,9 @@ class I2SAudioUDP : public Component {
   // Statistics
   volatile uint32_t tx_packets_{0};
   volatile uint32_t rx_packets_{0};
+
+  // Playback level, 0..1. Written by the audio task, read from the main loop.
+  std::atomic<float> peak_level_{0.0f};
 
   // Triggers
   Trigger<> on_start_trigger_;
