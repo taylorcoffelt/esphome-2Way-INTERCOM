@@ -631,6 +631,20 @@ void I2SAudioUDP::audio_task(void *params) {
         if (got == frame_bytes) {
           self->apply_software_volume_(spk_buffer, frame_size);
 
+          // Playback level for the UI. Measured on the mono frame, before any
+          // stereo widening, so the number means the same thing whichever bus
+          // mode is in use. Decayed rather than replaced so silence falls off
+          // smoothly instead of snapping to zero between frames.
+          int32_t chunk_max = 0;
+          for (int i = 0; i < frame_size; i++) {
+            int32_t mag = (spk_buffer[i] < 0) ? -(int32_t) spk_buffer[i] : (int32_t) spk_buffer[i];
+            if (mag > chunk_max)
+              chunk_max = mag;
+          }
+          const float chunk_peak = (float) chunk_max / 32768.0f;
+          const float decayed = self->peak_level_.load() * 0.85f;
+          self->peak_level_.store(chunk_peak > decayed ? chunk_peak : decayed);
+
           if (spk_stereo && spk_wide) {
             for (int i = 0; i < frame_size; i++) {
               spk_wide[2 * i] = spk_buffer[i];
@@ -747,6 +761,7 @@ void I2SAudioUDP::audio_task(void *params) {
   if (aec_output) heap_caps_free(aec_output);
   if (last_speaker) heap_caps_free(last_speaker);
   self->audio_ring_buffer_.reset();
+  self->peak_level_.store(0.0f);
 
   ESP_LOGD(TAG, "Audio task stopped");
   vTaskDelete(NULL);
@@ -827,6 +842,10 @@ void I2SAudioUDP::stop() {
     }
     this->audio_task_handle_ = nullptr;
   }
+
+  // Anything reading the level now should see a flat line, not the last frame
+  // that happened to be playing when the stream was torn down.
+  this->peak_level_.store(0.0f);
 
   this->close_sockets_();
   this->deinit_i2s_();
