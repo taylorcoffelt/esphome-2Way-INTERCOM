@@ -42,7 +42,11 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_FRAME_TIMEOUT, default="3s"): cv.positive_time_period_milliseconds,
         }
     ).extend(cv.COMPONENT_SCHEMA),
-    cv.only_with_esp_idf,
+    # NOT cv.only_with_esp_idf - that helper does not exist in ESPHome 2026.8.1
+    # and the AttributeError fires at module import, i.e. before a single line
+    # of the user's YAML is validated, so the failure looks like a broken config
+    # rather than a broken component.
+    cv.only_with_framework("esp-idf"),
 )
 
 
