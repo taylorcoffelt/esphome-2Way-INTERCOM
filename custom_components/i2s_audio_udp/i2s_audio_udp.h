@@ -157,7 +157,16 @@ class I2SAudioUDP : public Component {
   // set_volume(): a test that is silent because the volume slider happens to be
   // down has tested nothing. The codec's own output level still applies. The
   // tone is ramped in and out over 5ms so the amplifier does not pop.
-  void play_tone(uint32_t freq_hz, uint32_t duration_ms, float amplitude = 0.25f);
+  //
+  // decay_ms shapes the sustain. Left at 0 the note holds flat for its whole
+  // duration, which is what a test tone wants and what every existing caller
+  // gets. Set non-zero it applies exp(-t / tau) from onset, with tau picked so
+  // the amplitude is down to about 5% of peak at decay_ms - a struck-and-ringing
+  // shape rather than a held organ note. A decay_ms at or beyond duration_ms
+  // just means the note is still audibly decaying when it ends. The 5ms attack
+  // ramp applies either way; without it the onset clicks.
+  void play_tone(uint32_t freq_hz, uint32_t duration_ms, float amplitude = 0.25f,
+                 uint32_t decay_ms = 0);
 
   // ─────────────────────────────────────────────────────────────────────────
   // Volume Control
@@ -176,6 +185,48 @@ class I2SAudioUDP : public Component {
   // from it falls back toward zero through silence instead of freezing at the
   // last loud frame. Reads flat while stopped - nothing is updating it then.
   float get_peak_level() { return this->streaming_ ? this->peak_level_.load() : 0.0f; }
+
+  // Number of entries in the recent-levels ring. One entry is pushed per audio
+  // frame processed by the playback path, so the window this covers is
+  // LEVEL_HISTORY_SIZE * (frame_size / sample_rate) - on the order of a second
+  // or two at 16kHz. Power of two on purpose; see copy_levels().
+  static constexpr size_t LEVEL_HISTORY_SIZE = 64;
+
+  // Copies up to `max` of the most recent levels, OLDEST FIRST.
+  // Returns the number actually written.
+  //
+  // Why this exists alongside get_peak_level(): the ESPHome main loop can be
+  // blocked for hundreds of milliseconds at a time by unrelated synchronous
+  // work, and anything sampling get_peak_level() on an interval simply loses
+  // every frame that went by while it was stuck - the waveform then advances in
+  // bursts. The audio task is never blocked, so it records the history here and
+  // the UI reads the whole window whenever it next manages to run.
+  //
+  // Oldest-first is part of the contract: the caller draws left to right and
+  // must not have to know where the write head currently is.
+  //
+  // Locking, deliberately absent: the audio FreeRTOS task writes and the main
+  // loop reads, and the only synchronisation is the atomic write index. The
+  // sample array is plain aligned floats because a 4-byte aligned load or store
+  // cannot tear on Xtensa, so the worst a racing reader can see is a sample one
+  // frame staler than it expected - invisible in a waveform. Taking a mutex in
+  // the audio path would risk stalling playback to protect a drawing, which is
+  // the wrong trade. Please do not "fix" this into a lock.
+  size_t copy_levels(float *out, size_t max) {
+    if (out == nullptr || max == 0)
+      return 0;
+    // Total pushes ever, not a wrapped index - the modulo below turns it into
+    // one. LEVEL_HISTORY_SIZE divides 2^32, so this stays correct across the
+    // eventual uint32_t rollover.
+    const uint32_t total = this->level_write_index_.load(std::memory_order_acquire);
+    size_t have = (total < (uint32_t) LEVEL_HISTORY_SIZE) ? (size_t) total : LEVEL_HISTORY_SIZE;
+    if (have > max)
+      have = max;
+    const uint32_t start = total - (uint32_t) have;
+    for (size_t i = 0; i < have; i++)
+      out[i] = this->level_history_[(size_t) ((start + (uint32_t) i) % LEVEL_HISTORY_SIZE)];
+    return have;
+  }
 
   const char* get_audio_mode_text() const;
   I2SBusMode get_bus_mode() const { return this->bus_mode_; }
@@ -196,6 +247,25 @@ class I2SAudioUDP : public Component {
   bool init_sockets_();
   void close_sockets_();
   void apply_software_volume_(int16_t *buffer, size_t samples);
+
+  // Append one level to the history ring. Audio task only. The sample is
+  // written before the index is published with release ordering, which is what
+  // makes the acquire load in copy_levels() safe to pair with.
+  void push_level_(float level) {
+    const uint32_t idx = this->level_write_index_.load(std::memory_order_relaxed);
+    this->level_history_[(size_t) (idx % LEVEL_HISTORY_SIZE)] = level;
+    this->level_write_index_.store(idx + 1, std::memory_order_release);
+  }
+
+  // Flatten the history. Called wherever peak_level_ is zeroed, so a stopped
+  // stream draws as a flat line instead of whatever was playing when it went
+  // away. The write index is intentionally left alone: zeroed samples already
+  // read as silence, and resetting it would make copy_levels() return a
+  // shrinking window instead.
+  void clear_levels_() {
+    for (size_t i = 0; i < LEVEL_HISTORY_SIZE; i++)
+      this->level_history_[i] = 0.0f;
+  }
 
   // True when the speaker channel carries two slots per frame, so a mono
   // source has to be duplicated across both before it is written. The
@@ -252,7 +322,7 @@ class I2SAudioUDP : public Component {
   bool i2s_held_open_{false};
   i2s_chan_handle_t tx_handle_{nullptr};
   i2s_chan_handle_t rx_handle_{nullptr};
-  std::unique_ptr<RingBuffer> audio_ring_buffer_;
+  std::unique_ptr<esphome::ring_buffer::RingBuffer> audio_ring_buffer_;
   int send_socket_{-1};
   int recv_socket_{-1};
   struct sockaddr_in remote_addr_;
@@ -264,6 +334,13 @@ class I2SAudioUDP : public Component {
 
   // Playback level, 0..1. Written by the audio task, read from the main loop.
   std::atomic<float> peak_level_{0.0f};
+
+  // Recent history of that same level, one entry per processed frame. Plain
+  // floats guarded only by the atomic index below - see copy_levels() for why
+  // that is enough and why a lock would be worse. Unrelated to
+  // audio_ring_buffer_ above, which carries PCM.
+  float level_history_[LEVEL_HISTORY_SIZE]{};
+  std::atomic<uint32_t> level_write_index_{0};
 
   // Triggers
   Trigger<> on_start_trigger_;
