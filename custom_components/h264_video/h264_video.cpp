@@ -53,6 +53,13 @@ static const uint32_t MAX_NAL_SIZE = 32768;
 // bytes per datagram, so they have to come back before the decoder sees them.
 static const uint8_t START_CODE[4] = {0x00, 0x00, 0x00, 0x01};
 
+// The NAL header is the byte immediately after the start code, and its low five
+// bits are the unit type: 1 non-IDR slice, 5 IDR slice, 7 SPS, 8 PPS. Only the
+// SPS needs naming here - it is the one type that makes the stream decodable
+// from that byte onwards, which is what the join gate in decode_nal_() waits
+// for.
+static const uint8_t NAL_TYPE_SPS = 7;
+
 // How long the socket blocks before the loop rechecks running_. Short enough
 // that stop() joins promptly, long enough that a silent stream does not spin.
 static const int RECV_TIMEOUT_MS = 100;
@@ -435,6 +442,36 @@ void H264Video::decode_nal_(uint32_t nal_len_with_start_code) {
   if (this->decoder_ == nullptr)
     return;
 
+  // Nothing reaches the decoder until the stream has been synchronised to a
+  // parameter set.
+  //
+  // The sender runs continuously and we join it wherever the socket happens to
+  // open, so the first NALs to arrive are almost always P-slices from a GOP
+  // whose SPS, PPS and IDR went past before this receiver existed. The trap is
+  // that tinyh264 does not reject them: it decodes them against a reference
+  // picture it never received, reports a picture ready, and hands back a frame
+  // whose luma is noise and whose chroma sits at the extremes - which is the
+  // green and magenta the display shows for the first second or two of every
+  // stream. There is no error to test for downstream, because as far as the
+  // decoder is concerned nothing went wrong, so the only place to stop it is
+  // here, before it is ever given the slice.
+  //
+  // Waiting costs at most one keyframe interval: the sender runs with
+  // repeat-headers=1, so an SPS and PPS precede every IDR, and starting the
+  // feed at an SPS guarantees the decoder holds its parameter sets before it
+  // sees its first slice. NALs skipped this way are counted as drops rather
+  // than decode errors - landing mid-GOP is what joining a live stream looks
+  // like, not a fault.
+  if (!this->synced_) {
+    if ((this->nal_buf_[sizeof(START_CODE)] & 0x1F) != NAL_TYPE_SPS) {
+      this->nals_dropped_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    this->synced_ = true;
+    ESP_LOGI(TAG, "Stream synchronised on SPS after %u NAL(s) skipped mid-GOP",
+             (unsigned) this->nals_dropped_.load(std::memory_order_relaxed));
+  }
+
   esp_h264_dec_in_frame_t in = {};
   in.raw_data.buffer = this->nal_buf_;
   in.raw_data.len = nal_len_with_start_code;
@@ -607,6 +644,9 @@ void H264Video::start() {
   }
 
   this->reset_reassembly_();
+  // Sync is per-run: a fresh socket is a fresh join, and the SPS that made the
+  // last run decodable says nothing about where this one lands in the GOP.
+  this->synced_ = false;
   this->back_index_ = 0;
   this->published_index_.store(-1, std::memory_order_release);
   this->new_frame_.store(false, std::memory_order_release);
@@ -687,6 +727,7 @@ void H264Video::stop() {
   // pointing into a buffer that is about to be released.
   this->published_index_.store(-1, std::memory_order_release);
   this->new_frame_.store(false, std::memory_order_release);
+  this->synced_ = false;
 
   this->close_socket_();
   this->close_decoder_();
