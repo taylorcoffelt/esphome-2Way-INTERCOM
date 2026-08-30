@@ -131,6 +131,12 @@ class H264Video : public Component {
   uint8_t frag_count_{0};
   bool nal_in_progress_{false};
 
+  // False until an SPS has been seen on this run. The receiver joins a stream
+  // that is already in flight, so the first NALs it gets belong to a GOP whose
+  // parameter sets and IDR are long gone - see decode_nal_() for why feeding
+  // those to the decoder produces a picture rather than an error.
+  bool synced_{false};
+
   uint8_t *rx_buf_{nullptr};
 
   // Double-buffered output. The task only ever writes fb_[back_index_]; LVGL
