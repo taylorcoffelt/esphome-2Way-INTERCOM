@@ -14,6 +14,7 @@
 #include <driver/i2s_std.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 #include <lwip/sockets.h>
 #include <lwip/netdb.h>
 
@@ -327,6 +328,13 @@ class I2SAudioUDP : public Component {
   int recv_socket_{-1};
   struct sockaddr_in remote_addr_;
   TaskHandle_t audio_task_handle_{nullptr};
+
+  // Given exactly once by audio_task on every one of its exit paths, taken by
+  // stop() to join it. A self-deleted task's handle is reaped by the idle task
+  // almost immediately, so polling eTaskGetState() on it reads freed memory;
+  // this is the only safe way to know the task is actually gone before the
+  // state it was using is torn down.
+  SemaphoreHandle_t task_done_{nullptr};
 
   // Statistics
   volatile uint32_t tx_packets_{0};
