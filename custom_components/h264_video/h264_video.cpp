@@ -64,15 +64,6 @@ static const uint8_t NAL_TYPE_SPS = 7;
 // that stop() joins promptly, long enough that a silent stream does not spin.
 static const int RECV_TIMEOUT_MS = 100;
 
-// ESPHome's LVGL build byte-swaps RGB565 when the panel wants big-endian
-// halfwords. Doing it in the packer costs nothing (the value is already in a
-// register) whereas a second pass over 64800 bytes of PSRAM would not be.
-#if defined(USE_LVGL) && defined(LV_COLOR_16_SWAP) && LV_COLOR_16_SWAP
-#define H264_VIDEO_RGB565_SWAP 1
-#else
-#define H264_VIDEO_RGB565_SWAP 0
-#endif
-
 static inline uint8_t clamp_u8(int32_t v) {
   if (v < 0)
     return 0;
@@ -81,12 +72,35 @@ static inline uint8_t clamp_u8(int32_t v) {
   return (uint8_t) v;
 }
 
+// RGB565 in native byte order. Nothing here pre-swaps, and that is the whole
+// point of this comment.
+//
+// The trap is that LV_COLOR_16_SWAP reads like it describes the framebuffer and
+// does not - under ESPHome it describes the *panel*. The lvgl component sets it
+// from the display's byte_order, which is big_endian for this ST7789, so it is
+// 1 in this build; then LvglComponent::draw_buffer_ hands that same flag to
+// display->draw_pixels_at() as its bswap argument. The swap happens once, at
+// flush, on the way out to the bus. LVGL 9 reads the macro in exactly one place
+// of its own - a v8 compatibility shim in lv_refr.c gated on
+// LV_DISPLAY_RENDER_MODE_DIRECT - and ESPHome renders PARTIAL or FULL, so that
+// shim never runs either.
+//
+// Everything LVGL composites from must therefore be native little-endian
+// RGB565, image descriptors included. ESPHome's own assets agree: the image
+// component defaults RGB565 to LITTLE_ENDIAN and warns if you ask for
+// big-endian, and those are the online_image sources that render correctly
+// beside this one.
+//
+// Swapping here got swapped again at flush and put every pixel on the panel
+// reversed. That is not a tint. 0xFFFF and 0x0000 are palindromes, so white and
+// black come through untouched while everything between them lands in the
+// greens and magentas - a permanent green-and-purple picture with motion still
+// perfectly legible, because the luma structure is entirely intact and only the
+// byte order is wrong. Nor does a converter unit test catch it: built outside
+// the firmware there is no USE_LVGL, the swap compiled out, and the test
+// measured the one configuration the device never builds.
 static inline uint16_t pack_rgb565(int32_t r, int32_t g, int32_t b) {
-  uint16_t c = (uint16_t) (((clamp_u8(r) & 0xF8) << 8) | ((clamp_u8(g) & 0xFC) << 3) | (clamp_u8(b) >> 3));
-#if H264_VIDEO_RGB565_SWAP
-  c = (uint16_t) ((c >> 8) | (c << 8));
-#endif
-  return c;
+  return (uint16_t) (((clamp_u8(r) & 0xF8) << 8) | ((clamp_u8(g) & 0xFC) << 3) | (clamp_u8(b) >> 3));
 }
 
 // I420 -> RGB565.
@@ -172,11 +186,9 @@ void H264Video::dump_config() {
   ESP_LOGCONFIG(TAG, "  Frame Timeout: %u ms", (unsigned) this->frame_timeout_ms_);
   ESP_LOGCONFIG(TAG, "  Task: core %d, priority %u, %u byte stack", TASK_CORE, (unsigned) TASK_PRIORITY,
                 (unsigned) TASK_STACK_SIZE);
-#if H264_VIDEO_RGB565_SWAP
-  ESP_LOGCONFIG(TAG, "  Pixel Order: RGB565 byte-swapped (LV_COLOR_16_SWAP)");
-#else
-  ESP_LOGCONFIG(TAG, "  Pixel Order: RGB565 native");
-#endif
+  // Unconditional now - see the note above pack_rgb565. Any swap the panel wants
+  // is ESPHome's to apply at flush, and applying it here too was the bug.
+  ESP_LOGCONFIG(TAG, "  Pixel Order: RGB565 native little-endian");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
