@@ -592,6 +592,15 @@ void I2SAudioUDP::audio_task(void *params) {
   self->audio_ring_buffer_ = ring_buffer::RingBuffer::create(RING_BUFFER_SIZE);
   if (self->audio_ring_buffer_ == nullptr) {
     ESP_LOGE(TAG, "Failed to allocate ring buffer");
+    // This is an exit path and has to behave like one. Leaving streaming_ true
+    // wedges the component for good: start() refuses with "Already streaming"
+    // and is_streaming() reports a stream that does not exist. Giving the
+    // semaphore matters just as much - a later stop() joins on it, and a task
+    // that leaves without giving it makes that join wait out its full timeout
+    // for a task that is already gone.
+    self->streaming_ = false;
+    if (self->task_done_ != nullptr)
+      xSemaphoreGive(self->task_done_);
     vTaskDelete(NULL);
     return;
   }
@@ -787,18 +796,28 @@ void I2SAudioUDP::audio_task(void *params) {
     }
   }
 
-  // Cleanup
+  // Cleanup, and deliberately only of what this task itself allocated.
+  //
+  // Everything else it touched - audio_ring_buffer_, peak_level_, the level
+  // history - is owned by stop(), which tears it down after joining on
+  // task_done_. This task must not touch that state on its way out, because it
+  // cannot know it still owns it: if stop() timed out waiting and a later
+  // start() built a new ring buffer for a new task, a zombie freeing "its"
+  // ring buffer here would be destroying the new one, and the new task would
+  // then dereference a destroyed unique_ptr - LoadProhibited, reboot.
   if (mic_buffer) heap_caps_free(mic_buffer);
   if (mic_buffer_32) heap_caps_free(mic_buffer_32);
   if (spk_buffer) heap_caps_free(spk_buffer);
   if (spk_wide) heap_caps_free(spk_wide);
   if (aec_output) heap_caps_free(aec_output);
   if (last_speaker) heap_caps_free(last_speaker);
-  self->audio_ring_buffer_.reset();
-  self->peak_level_.store(0.0f);
-  self->clear_levels_();
 
   ESP_LOGD(TAG, "Audio task stopped");
+
+  // Last thing before the task ceases to exist, so a stop() that returns from
+  // its take() knows nothing of this task is still running.
+  if (self->task_done_ != nullptr)
+    xSemaphoreGive(self->task_done_);
   vTaskDelete(NULL);
 }
 
@@ -840,6 +859,18 @@ void I2SAudioUDP::start() {
   this->tx_packets_ = 0;
   this->rx_packets_ = 0;
 
+  // Created before the task exists, so there is no window in which the task is
+  // running and has nothing to signal its exit on. stop() takes this to join.
+  this->task_done_ = xSemaphoreCreateBinary();
+  if (this->task_done_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to create audio task semaphore");
+    this->streaming_ = false;
+    this->close_sockets_();
+    this->deinit_i2s_();
+    this->on_error_trigger_.trigger("Task creation failed");
+    return;
+  }
+
   // Create audio task
   BaseType_t result = xTaskCreatePinnedToCore(
     audio_task, "i2s_audio_udp", TASK_STACK_SIZE, this, TASK_PRIORITY, &this->audio_task_handle_, 1
@@ -848,6 +879,8 @@ void I2SAudioUDP::start() {
   if (result != pdPASS) {
     ESP_LOGE(TAG, "Failed to create audio task");
     this->streaming_ = false;
+    vSemaphoreDelete(this->task_done_);
+    this->task_done_ = nullptr;
     this->close_sockets_();
     this->deinit_i2s_();
     this->on_error_trigger_.trigger("Task creation failed");
@@ -868,15 +901,34 @@ void I2SAudioUDP::stop() {
 
   this->streaming_ = false;
 
-  // Wait for audio task
+  // Join the audio task.
+  //
+  // This used to poll eTaskGetState() on the handle. That is a use-after-free:
+  // the task self-deletes with vTaskDelete(NULL), the idle task reaps its TCB
+  // almost immediately, and since the task is pinned to core 1 while this runs
+  // on the main task the poll usually misses the eDeleted window entirely and
+  // then reads a dangling pointer into freed heap for every remaining
+  // iteration. The timeout was the normal exit path, not the exceptional one.
   if (this->audio_task_handle_ != nullptr) {
-    int wait_count = 0;
-    while (eTaskGetState(this->audio_task_handle_) != eDeleted && wait_count < 50) {
-      vTaskDelay(pdMS_TO_TICKS(10));
-      wait_count++;
+    // 2s, not the old 500ms: every blocking call in the task loop is capped at
+    // 50ms, so a healthy task always exits well inside this. A timeout here now
+    // means something is genuinely wrong, rather than being the routine path.
+    if (this->task_done_ != nullptr &&
+        xSemaphoreTake(this->task_done_, pdMS_TO_TICKS(2000)) != pdTRUE) {
+      ESP_LOGE(TAG, "Audio task did not exit within 2s; tearing down anyway");
+    }
+    if (this->task_done_ != nullptr) {
+      vSemaphoreDelete(this->task_done_);
+      this->task_done_ = nullptr;
     }
     this->audio_task_handle_ = nullptr;
   }
+
+  // The task is gone (or has been given up on), so stop() is what owns this
+  // state - the task used to free the ring buffer itself, which is exactly the
+  // bug: a timed-out task that woke up later destroyed a ring buffer a newer
+  // start() had already handed to a newer task.
+  this->audio_ring_buffer_.reset();
 
   // Anything reading the level now should see a flat line, not the last frame
   // that happened to be playing when the stream was torn down. Same for the
