@@ -38,6 +38,12 @@ static const ssize_t TASK_PRIORITY = 19;
 // and this needs no more precision than float carries.
 static const float TWO_PI_F = 6.28318530718f;
 
+// -ln(0.05). exp(-t/tau) has fallen to 5% of peak once t reaches tau times
+// this, so a caller-supplied decay_ms converts to tau by dividing by it. 5%
+// rather than zero because an exponential never actually reaches zero, and 5%
+// is already below what a small speaker resolves against room noise.
+static const float DECAY_LN_20 = 2.99573227f;
+
 void I2SAudioUDP::setup() {
   ESP_LOGD(TAG, "Setting up...");
 
@@ -133,7 +139,10 @@ bool I2SAudioUDP::speaker_is_stereo_() const {
   return this->bus_mode_ == I2S_BUS_SINGLE;
 }
 
-void I2SAudioUDP::play_tone(uint32_t freq_hz, uint32_t duration_ms, float amplitude) {
+// Note: decay_ms carries no default here. It is declared with one in the
+// header, and repeating it in the definition is a redefinition error.
+void I2SAudioUDP::play_tone(uint32_t freq_hz, uint32_t duration_ms, float amplitude,
+                            uint32_t decay_ms) {
   if (this->audio_mode_ == AUDIO_MODE_TX_ONLY) {
     ESP_LOGW(TAG, "play_tone: no speaker configured (TX_ONLY)");
     return;
@@ -151,6 +160,16 @@ void I2SAudioUDP::play_tone(uint32_t freq_hz, uint32_t duration_ms, float amplit
   // 5ms of linear ramp at each end. A tone that starts at full amplitude on a
   // zero crossing still steps the amplifier hard enough to click.
   const size_t ramp = std::min<size_t>(total / 2, rate / 200);
+
+  // Decay envelope, off by default. Held flat, a note reads as an organ; a
+  // chime is the same sine struck and then allowed to die away. Stored as
+  // 1/tau so the inner loop multiplies instead of divides. A decay_ms longer
+  // than the note itself is fine and needs no special case - the note simply
+  // ends while still ringing.
+  const float decay_samples = (float)((uint64_t)decay_ms * rate / 1000ULL);
+  const float inv_tau = (decay_ms > 0 && decay_samples >= 1.0f)
+                            ? (DECAY_LN_20 / decay_samples)
+                            : 0.0f;
 
   const bool streaming = this->streaming_;
   bool temp_i2s = false;
@@ -192,6 +211,12 @@ void I2SAudioUDP::play_tone(uint32_t freq_hz, uint32_t duration_ms, float amplit
           env = (float)(total - idx) / (float)ramp;
         }
       }
+      // Applied on top of the ramps, never in place of them: the attack ramp
+      // is what keeps the onset from clicking, and the decay starts at full
+      // amplitude, so dropping the ramp would put the click back.
+      if (inv_tau > 0.0f) {
+        env *= expf(-(float)idx * inv_tau);
+      }
       mono[i] = (int16_t)(sinf(phase) * amplitude * env * 32767.0f);
       phase += step;
       if (phase > TWO_PI_F)
@@ -225,8 +250,8 @@ void I2SAudioUDP::play_tone(uint32_t freq_hz, uint32_t duration_ms, float amplit
     this->deinit_i2s_();
   }
 
-  ESP_LOGI(TAG, "play_tone: %u Hz for %u ms at %.0f%%", (unsigned)freq_hz,
-           (unsigned)duration_ms, amplitude * 100.0f);
+  ESP_LOGI(TAG, "play_tone: %u Hz for %u ms at %.0f%% (decay %u ms)", (unsigned)freq_hz,
+           (unsigned)duration_ms, amplitude * 100.0f, (unsigned)decay_ms);
 }
 
 bool I2SAudioUDP::init_i2s_single_bus_() {
@@ -564,7 +589,7 @@ void I2SAudioUDP::audio_task(void *params) {
   size_t bytes_read, bytes_written;
 
   // Create ring buffer
-  self->audio_ring_buffer_ = RingBuffer::create(RING_BUFFER_SIZE);
+  self->audio_ring_buffer_ = ring_buffer::RingBuffer::create(RING_BUFFER_SIZE);
   if (self->audio_ring_buffer_ == nullptr) {
     ESP_LOGE(TAG, "Failed to allocate ring buffer");
     vTaskDelete(NULL);
@@ -643,7 +668,16 @@ void I2SAudioUDP::audio_task(void *params) {
           }
           const float chunk_peak = (float) chunk_max / 32768.0f;
           const float decayed = self->peak_level_.load() * 0.85f;
-          self->peak_level_.store(chunk_peak > decayed ? chunk_peak : decayed);
+          const float level = chunk_peak > decayed ? chunk_peak : decayed;
+          self->peak_level_.store(level);
+
+          // Same value, also appended to the history ring - exactly one entry
+          // per frame that reaches the speaker. The main loop can be stalled
+          // for hundreds of milliseconds by unrelated work and would otherwise
+          // lose every frame in that gap; this task never stalls, so it keeps
+          // the record and copy_levels() hands the whole window over at
+          // whatever rate the UI manages to ask for it.
+          self->push_level_(level);
 
           if (spk_stereo && spk_wide) {
             for (int i = 0; i < frame_size; i++) {
@@ -762,6 +796,7 @@ void I2SAudioUDP::audio_task(void *params) {
   if (last_speaker) heap_caps_free(last_speaker);
   self->audio_ring_buffer_.reset();
   self->peak_level_.store(0.0f);
+  self->clear_levels_();
 
   ESP_LOGD(TAG, "Audio task stopped");
   vTaskDelete(NULL);
@@ -844,8 +879,10 @@ void I2SAudioUDP::stop() {
   }
 
   // Anything reading the level now should see a flat line, not the last frame
-  // that happened to be playing when the stream was torn down.
+  // that happened to be playing when the stream was torn down. Same for the
+  // history behind it, or a waveform would keep showing the old audio.
   this->peak_level_.store(0.0f);
+  this->clear_levels_();
 
   this->close_sockets_();
   this->deinit_i2s_();
