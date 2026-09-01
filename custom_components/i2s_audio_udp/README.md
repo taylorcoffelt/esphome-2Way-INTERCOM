@@ -10,7 +10,6 @@ Bidirectional audio streaming over UDP with I2S hardware support for ESP32.
 - **Software volume control**: Built-in volume adjustment
 - **AEC integration**: Optional link to `esp_aec` component for echo cancellation
 - **Platform sensors**: TX/RX packet counters, audio mode text sensor, volume number
-- **Monitor-only mode**: `monitor_only: true` drives a level/waveform display on a device with no audio hardware at all - see below
 
 ## Configuration
 
@@ -49,9 +48,6 @@ i2s_audio_udp:
   # Or with templates:
   remote_ip: !lambda 'return id(target_ip).state;'
 
-  # Levels only, no audio hardware (see "Monitor-only mode" below)
-  monitor_only: false
-
   # Optional AEC
   aec_id: my_aec
 
@@ -64,57 +60,6 @@ i2s_audio_udp:
     - logger.log:
         format: "Error: %s"
         args: [error.c_str()]
-```
-
-## Monitor-only mode
-
-```yaml
-i2s_audio_udp:
-  id: audio_levels
-  monitor_only: true
-
-  # No I2S pins. None are read, so none are required.
-  remote_ip: "192.168.1.10"   # still required; see note below
-  remote_port: 12345
-  listen_port: 12346
-```
-
-For a device that wants the **waveform without the audio**: a wall panel that
-should show what the intercom is carrying, but has no codec, no speaker, and -
-with an RGB display already using most of its GPIOs - no pins to spare for
-clocking an I2S bus into nothing.
-
-With `monitor_only: true` the component:
-
-- **never touches I2S.** No channel is allocated in `setup()` or `start()`, no
-  pins are configured, no codec is assumed. The I2S pin options stop being
-  required; any that are left in the YAML are ignored.
-- **receives, measures and discards.** The audio task binds `listen_port` as
-  usual, reads each datagram as 16-bit little-endian mono PCM, takes the peak of
-  the chunk and applies the same decay the speaker path applies, then throws the
-  samples away. Nothing is buffered, because nothing would ever play it.
-- **behaves identically everywhere else.** `start()`, `stop()`, `is_streaming()`,
-  `on_start` / `on_stop` / `on_error`, `get_peak_level()`, `copy_levels()` and
-  the RX packet counter all work exactly as they do with hardware attached, so
-  the same waveform display code runs on both kinds of device.
-
-`play_tone()` and `hold_i2s_open()` become no-ops in this mode - there is no
-output to make a sound on and no channel to hold open. Each logs one warning the
-first time it is called and then stays quiet.
-
-The mode is fixed at build time from the YAML; it cannot be toggled at runtime.
-
-**Note:** `remote_ip` and `remote_port` are still required by the schema even
-though a monitor-only device never sends. Any valid address will do - the
-component only parses it - but the keys have to be present.
-
-Reading the levels from a display:
-
-```yaml
-- lambda: |-
-    float levels[64];
-    size_t n = id(audio_levels).copy_levels(levels, 64);  // oldest first
-    // ... draw n points ...
 ```
 
 ## Actions
