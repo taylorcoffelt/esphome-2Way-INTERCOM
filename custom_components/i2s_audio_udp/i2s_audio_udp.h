@@ -73,6 +73,28 @@ class I2SAudioUDP : public Component {
   void set_speaker_dout_pin(int pin) { this->speaker_dout_pin_ = pin; }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // Monitor-only Mode
+  // ─────────────────────────────────────────────────────────────────────────
+  // Levels without audio.
+  //
+  // The component still binds its listen port and still measures every
+  // datagram that arrives, but it never touches I2S: no channel is allocated,
+  // no pins are driven, no codec is assumed. This exists for the wall panel,
+  // which wants the waveform of the intercom's stream but has no speaker to
+  // play it through and - with an 800x480 RGB panel already consuming most of
+  // its GPIOs - no pins to spare for clocking a bus into nothing.
+  //
+  // Everything a UI reads - is_streaming(), get_peak_level(), copy_levels(),
+  // the packet counters, on_start/on_stop - behaves exactly as it does with
+  // audio hardware attached, so one dashboard drives both kinds of device.
+  //
+  // Build-time only. start(), stop() and the audio task all branch on this and
+  // would have to be made to agree mid-stream if it could be toggled at
+  // runtime; nothing needs that, so nothing offers it.
+  void set_monitor_only(bool monitor_only) { this->monitor_only_ = monitor_only; }
+  bool is_monitor_only() const { return this->monitor_only_; }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // Audio Configuration
   // ─────────────────────────────────────────────────────────────────────────
   void set_sample_rate(uint32_t rate) { this->sample_rate_ = rate; }
@@ -125,6 +147,15 @@ class I2SAudioUDP : public Component {
   // already fires its on_start trigger after I2S is up, so that path is
   // correctly ordered without help.
   bool hold_i2s_open(bool open) {
+    // Nothing to hold open in monitor-only mode, and nothing downstream of it
+    // either: no codec to settle, no amplifier to thump. Reporting success is
+    // deliberate - the caller is an automation sequencing amp power around
+    // playback, and returning false would make one automation shared by both
+    // device types report a failure on a panel that has no amp to begin with.
+    if (this->monitor_only_) {
+      this->warn_monitor_noop_("hold_i2s_open", this->warned_hold_noop_);
+      return true;
+    }
     if (this->streaming_)
       return true;
     if (open) {
@@ -249,6 +280,12 @@ class I2SAudioUDP : public Component {
   void close_sockets_();
   void apply_software_volume_(int16_t *buffer, size_t samples);
 
+  // Emits one warning for a call monitor-only mode cannot honour, then stays
+  // quiet. Defined in the .cpp because the log TAG lives there. `warned` is the
+  // caller's own latch, so each distinct call site still gets its one line
+  // rather than the first one silencing the others.
+  void warn_monitor_noop_(const char *what, bool &warned);
+
   // Append one level to the history ring. Audio task only. The sample is
   // written before the index is published with release ordering, which is what
   // makes the acquire load in copy_levels() safe to pair with.
@@ -299,6 +336,15 @@ class I2SAudioUDP : public Component {
   int mic_gain_{1};
   int speaker_enable_pin_{-1};
   float volume_{1.0f};
+
+  // Levels-only operation; see set_monitor_only() above for what it is for.
+  bool monitor_only_{false};
+
+  // One-shot latches for the two entry points monitor-only cannot honour. A
+  // dashboard offering a "test tone" button to every device type would
+  // otherwise log a line per press for the life of the panel.
+  bool warned_tone_noop_{false};
+  bool warned_hold_noop_{false};
 
   // Network - runtime values (evaluated from templates)
   std::string remote_ip_;
