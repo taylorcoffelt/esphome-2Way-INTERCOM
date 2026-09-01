@@ -34,6 +34,7 @@ CONF_SPEAKER_DOUT_PIN = "speaker_dout_pin"
 
 # Audio configuration
 CONF_SAMPLE_RATE = "sample_rate"
+CONF_MONITOR_ONLY = "monitor_only"
 CONF_MIC_BITS_PER_SAMPLE = "mic_bits_per_sample"
 CONF_MIC_CHANNEL = "mic_channel"
 CONF_MIC_GAIN = "mic_gain"
@@ -74,6 +75,18 @@ EspAec = esp_aec_ns.class_("EspAec")
 
 def validate_config(config):
     """Validate and deduce I2S mode from pin configuration."""
+    # monitor_only has no I2S at all - no channel is ever allocated and no pin
+    # is ever driven - so the pin requirements below simply do not apply. This
+    # is the only relaxation the mode needs: the pins are all cv.Optional in the
+    # schema already, and it is this function that makes them mandatory.
+    #
+    # Left permissive rather than made exclusive on purpose: a panel YAML copied
+    # from the intercom may still carry the pin block, and rejecting it would
+    # force an edit for keys the component then ignores. deduce_modes_() pins
+    # the mode to RX_ONLY so those leftovers cannot influence anything.
+    if config[CONF_MONITOR_ONLY]:
+        return config
+
     single_bus_pins = [CONF_I2S_LRCLK_PIN, CONF_I2S_BCLK_PIN, CONF_I2S_DIN_PIN, CONF_I2S_DOUT_PIN, CONF_I2S_MCLK_PIN]
     dual_bus_pins = [CONF_MIC_LRCLK_PIN, CONF_MIC_BCLK_PIN, CONF_MIC_DIN_PIN,
                      CONF_SPEAKER_LRCLK_PIN, CONF_SPEAKER_BCLK_PIN, CONF_SPEAKER_DOUT_PIN]
@@ -130,6 +143,11 @@ CONFIG_SCHEMA = cv.All(
 
             cv.Optional(CONF_SAMPLE_RATE, default=16000): cv.int_range(min=8000, max=48000),
 
+            # Levels-only: receive the UDP PCM, measure it, throw it away. For a
+            # display that wants the waveform but has no codec, no speaker and
+            # no free pins to clock a bus into.
+            cv.Optional(CONF_MONITOR_ONLY, default=False): cv.boolean,
+
             # Single bus pins
             cv.Optional(CONF_I2S_LRCLK_PIN): pins.internal_gpio_output_pin_number,
             cv.Optional(CONF_I2S_BCLK_PIN): pins.internal_gpio_output_pin_number,
@@ -176,6 +194,7 @@ async def to_code(config):
     await cg.register_component(var, config)
 
     cg.add(var.set_sample_rate(config[CONF_SAMPLE_RATE]))
+    cg.add(var.set_monitor_only(config[CONF_MONITOR_ONLY]))
 
     # Single bus pins
     if CONF_I2S_LRCLK_PIN in config:
