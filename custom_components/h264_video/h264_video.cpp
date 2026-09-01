@@ -29,21 +29,22 @@ static const uint32_t TASK_STACK_SIZE = 8192;
 // The decoder emits macroblock-aligned frames and applies no cropping, so a
 // 240x135 stream would come back as 240x144 with nine rows of encoder padding
 // that the display must not show. The sender encodes 240x144 outright for that
-// reason; this is the height we expect back, but nothing below assumes it - the
-// real dimensions are read from the decoder after every picture.
-static const uint32_t EXPECTED_DECODE_HEIGHT = 144;
-
-static const uint32_t FB_PIXELS = (uint32_t) FRAME_WIDTH * FRAME_HEIGHT;
-static const uint32_t FB_BYTES = FB_PIXELS * 2;
+// reason, and source_height is what we expect back - but nothing below assumes
+// it, the real dimensions are read from the decoder after every picture and the
+// configured pair is only the fallback.
+//
+// The framebuffer size is output_width x output_height and therefore per
+// instance rather than a file-scope constant; see H264Video::fb_bytes_().
 
 // Wire header: 'H','2', uint16 LE sequence, uint8 fragment index, uint8
 // fragment count, two reserved bytes.
 static const uint32_t WIRE_HEADER_SIZE = 8;
 static const uint32_t MAX_DATAGRAM = 1400;
 
-// 255 fragments is what the one-byte count allows, but a 240x144 constrained
-// baseline IDR is a few KB and a P-frame far less. 32KB is roughly an order of
-// magnitude of headroom over anything this stream can produce while still being
+// 255 fragments is what the one-byte count allows, but a constrained baseline
+// IDR at the sizes this component is fed - 240x144, or 480x288 for the wall
+// panel - is a few KB and a P-frame far less. 32KB keeps roughly an order of
+// magnitude of headroom over anything either stream produces while still being
 // a rounding error in PSRAM, and it bounds the damage a lying fragment count
 // can do.
 static const uint32_t MAX_NAL_SIZE = 32768;
@@ -103,7 +104,36 @@ static inline uint16_t pack_rgb565(int32_t r, int32_t g, int32_t b) {
   return (uint16_t) (((clamp_u8(r) & 0xF8) << 8) | ((clamp_u8(g) & 0xFC) << 3) | (clamp_u8(b) >> 3));
 }
 
-// I420 -> RGB565.
+// Nearest-neighbour source index for output index i, sample-centre mapped:
+// floor((i + 0.5) * src / dst), in integers as ((2i + 1) * src) / (2 * dst).
+//
+// Two properties are load-bearing. It returns exactly i when src == dst, so an
+// unscaled axis is the identity and the two paths below agree on their shared
+// case; and it is always strictly less than src, because (2i + 1) is at most
+// (2*dst - 1), so a table built from it can never index off the end of a plane.
+static inline uint16_t nn_src_index(uint32_t i, uint32_t src, uint32_t dst) {
+  return (uint16_t) (((uint64_t) (2 * i + 1) * (uint64_t) src) / ((uint64_t) 2 * (uint64_t) dst));
+}
+
+// The three chroma terms of the BT.601 limited-range transform. They are
+// constant across every pixel sharing a chroma sample, which is the whole
+// reason the loops below are shaped around a quad. The +128 is the rounding
+// term for the >> 8 that follows.
+static inline void chroma_offsets(int32_t u, int32_t v, int32_t *r_off, int32_t *g_off, int32_t *b_off) {
+  const int32_t d = u - 128;
+  const int32_t e = v - 128;
+  *r_off = 409 * e + 128;
+  *g_off = -100 * d - 208 * e + 128;
+  *b_off = 516 * d + 128;
+}
+
+// One pixel: the luma term, then the same shift-and-pack as ever.
+static inline uint16_t yuv_to_rgb565(int32_t luma, int32_t r_off, int32_t g_off, int32_t b_off) {
+  const int32_t c = 298 * (luma - 16);
+  return pack_rgb565((c + r_off) >> 8, (c + g_off) >> 8, (c + b_off) >> 8);
+}
+
+// I420 -> RGB565, 1:1.
 //
 // esp_h264 ships no such converter - its only colour helper is YUYV->I420 for
 // the encoder path - so this is ours.
@@ -115,8 +145,13 @@ static inline uint16_t pack_rgb565(int32_t r, int32_t g, int32_t b) {
 // BT.601 limited-range transform is done in 8.8 fixed point: the chroma terms
 // are constant across the quad and hoisted out, leaving one multiply-add and a
 // shift per component per pixel and no division anywhere in the inner loop.
-static void i420_to_rgb565(const uint8_t *src, uint32_t src_w, uint32_t src_h, uint16_t *dst, uint32_t dst_w,
-                           uint32_t dst_h) {
+//
+// This is the original converter unchanged, and it stays a separate function
+// rather than a special case of the scaling one on purpose: the small panel
+// runs this path on every frame and must not pay a table lookup, a second
+// bounds test or a branch per pixel for a resample it never does.
+static void i420_copy_rgb565(const uint8_t *src, uint32_t src_w, uint32_t src_h, uint16_t *dst, uint32_t dst_w,
+                             uint32_t dst_h) {
   const uint32_t w = (src_w < dst_w) ? src_w : dst_w;
   const uint32_t h = (src_h < dst_h) ? src_h : dst_h;
   if (w == 0 || h == 0)
@@ -142,31 +177,143 @@ static void i420_to_rgb565(const uint8_t *src, uint32_t src_w, uint32_t src_h, u
     uint16_t *out1 = has_row1 ? (out0 + dst_w) : out0;
 
     for (uint32_t x = 0; x < w; x += 2) {
-      const int32_t d = (int32_t) row_u[x >> 1] - 128;
-      const int32_t e = (int32_t) row_v[x >> 1] - 128;
+      int32_t r_off, g_off, b_off;
+      chroma_offsets(row_u[x >> 1], row_v[x >> 1], &r_off, &g_off, &b_off);
 
-      // Chroma contributions, constant for all four pixels of the quad. The
-      // +128 is the rounding term for the >> 8 that follows.
-      const int32_t r_off = 409 * e + 128;
-      const int32_t g_off = -100 * d - 208 * e + 128;
-      const int32_t b_off = 516 * d + 128;
-
-      int32_t c = 298 * ((int32_t) row_y0[x] - 16);
-      out0[x] = pack_rgb565((c + r_off) >> 8, (c + g_off) >> 8, (c + b_off) >> 8);
-      if (x + 1 < w) {
-        c = 298 * ((int32_t) row_y0[x + 1] - 16);
-        out0[x + 1] = pack_rgb565((c + r_off) >> 8, (c + g_off) >> 8, (c + b_off) >> 8);
-      }
+      out0[x] = yuv_to_rgb565(row_y0[x], r_off, g_off, b_off);
+      if (x + 1 < w)
+        out0[x + 1] = yuv_to_rgb565(row_y0[x + 1], r_off, g_off, b_off);
 
       if (has_row1) {
-        c = 298 * ((int32_t) row_y1[x] - 16);
-        out1[x] = pack_rgb565((c + r_off) >> 8, (c + g_off) >> 8, (c + b_off) >> 8);
-        if (x + 1 < w) {
-          c = 298 * ((int32_t) row_y1[x + 1] - 16);
-          out1[x + 1] = pack_rgb565((c + r_off) >> 8, (c + g_off) >> 8, (c + b_off) >> 8);
-        }
+        out1[x] = yuv_to_rgb565(row_y1[x], r_off, g_off, b_off);
+        if (x + 1 < w)
+          out1[x + 1] = yuv_to_rgb565(row_y1[x + 1], r_off, g_off, b_off);
       }
     }
+  }
+}
+
+// I420 -> RGB565 with a nearest-neighbour resample folded into the same pass.
+//
+// One traversal, not two. The alternative - convert at source size, then let
+// LVGL scale the image on draw - reads and writes the 800x480 rectangle a
+// second time every frame, on the main loop, in the middle of the redraw this
+// component exists to feed.
+//
+// Nearest neighbour rather than bilinear is deliberate. This is a 10fps camera
+// feed being enlarged, not text: bilinear would cost three more multiplies and
+// three more plane reads per component per pixel to soften an image whose real
+// limit is the encoder, not the resampler.
+//
+// x_map and y_map hold the source index for each output column and row, built
+// once by build_scale_maps_(). No multiply or divide happens per pixel, and
+// because both tables are non-decreasing the source planes are still read in
+// forward order - which is what matters when they are in PSRAM.
+//
+// The quad structure survives scaling and is worth more here than at 1:1. When
+// two adjacent output columns land on the same source column (the common case
+// when enlarging) and the two output rows land on the same chroma row, all four
+// pixels share one chroma pair and it is loaded once, exactly as before.
+static void i420_scale_rgb565(const uint8_t *src, uint32_t src_w, uint32_t src_h, uint16_t *dst, uint32_t dst_w,
+                              uint32_t dst_h, const uint16_t *x_map, const uint16_t *y_map) {
+  if (dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0)
+    return;
+
+  // The tables were built for the configured source geometry; this frame's
+  // actual geometry comes from the decoder and is only checked against
+  // out_size. If the decoder ever hands back something smaller than configured,
+  // trim the output rather than read off the end of a plane. Both maps are
+  // non-decreasing, so testing the last entry and walking back is exact, and it
+  // is zero iterations whenever the geometry is what it should be.
+  uint32_t cols = dst_w;
+  while (cols > 0 && x_map[cols - 1] >= src_w)
+    cols--;
+  uint32_t rows = dst_h;
+  while (rows > 0 && y_map[rows - 1] >= src_h)
+    rows--;
+  if (cols == 0 || rows == 0)
+    return;
+
+  const uint32_t y_stride = src_w;
+  const uint32_t c_stride = src_w >> 1;
+  const uint8_t *plane_y = src;
+  const uint8_t *plane_u = plane_y + (uint32_t) src_w * src_h;
+  const uint8_t *plane_v = plane_u + ((uint32_t) src_w * src_h >> 2);
+
+  for (uint32_t dy = 0; dy < rows; dy += 2) {
+    const uint32_t sy0 = y_map[dy];
+    // Same odd-height guard as the 1:1 path, on the output side: an 800x480
+    // target is even, but nothing here requires it to be.
+    const bool has_row1 = (dy + 1) < rows;
+    const uint32_t sy1 = has_row1 ? y_map[dy + 1] : sy0;
+
+    const uint8_t *row_y0 = plane_y + (uint32_t) sy0 * y_stride;
+    const uint8_t *row_y1 = plane_y + (uint32_t) sy1 * y_stride;
+
+    const uint32_t cy0 = sy0 >> 1;
+    const uint32_t cy1 = sy1 >> 1;
+    const bool same_c_row = (cy0 == cy1);
+    const uint8_t *row_u0 = plane_u + cy0 * c_stride;
+    const uint8_t *row_v0 = plane_v + cy0 * c_stride;
+    const uint8_t *row_u1 = same_c_row ? row_u0 : (plane_u + cy1 * c_stride);
+    const uint8_t *row_v1 = same_c_row ? row_v0 : (plane_v + cy1 * c_stride);
+
+    uint16_t *out0 = dst + (uint32_t) dy * dst_w;
+    uint16_t *out1 = has_row1 ? (out0 + dst_w) : out0;
+
+    for (uint32_t dx = 0; dx < cols; dx += 2) {
+      const uint32_t sx0 = x_map[dx];
+      const bool has_col1 = (dx + 1) < cols;
+      const uint32_t sx1 = has_col1 ? x_map[dx + 1] : sx0;
+      const uint32_t cx0 = sx0 >> 1;
+      const uint32_t cx1 = sx1 >> 1;
+      const bool same_c_col = (cx0 == cx1);
+
+      // Top-left. When the quad is chroma-uniform - both output columns on one
+      // source chroma column and both output rows on one chroma row - this is
+      // the only chroma load the quad performs.
+      int32_t r00, g00, b00;
+      chroma_offsets(row_u0[cx0], row_v0[cx0], &r00, &g00, &b00);
+
+      int32_t r01 = r00, g01 = g00, b01 = b00;
+      if (has_col1 && !same_c_col)
+        chroma_offsets(row_u0[cx1], row_v0[cx1], &r01, &g01, &b01);
+
+      out0[dx] = yuv_to_rgb565(row_y0[sx0], r00, g00, b00);
+      if (has_col1)
+        out0[dx + 1] = yuv_to_rgb565(row_y0[sx1], r01, g01, b01);
+
+      if (has_row1) {
+        int32_t r10 = r00, g10 = g00, b10 = b00;
+        int32_t r11 = r01, g11 = g01, b11 = b01;
+        if (!same_c_row) {
+          chroma_offsets(row_u1[cx0], row_v1[cx0], &r10, &g10, &b10);
+          if (has_col1 && !same_c_col) {
+            chroma_offsets(row_u1[cx1], row_v1[cx1], &r11, &g11, &b11);
+          } else {
+            r11 = r10;
+            g11 = g10;
+            b11 = b10;
+          }
+        }
+
+        out1[dx] = yuv_to_rgb565(row_y1[sx0], r10, g10, b10);
+        if (has_col1)
+          out1[dx + 1] = yuv_to_rgb565(row_y1[sx1], r11, g11, b11);
+      }
+    }
+  }
+}
+
+// The one entry point the decode path calls. A null map pair means the output
+// rectangle equals the visible source rectangle, so no resampling is needed and
+// the original 1:1 loop runs untouched.
+static void i420_to_rgb565(const uint8_t *src, uint32_t src_w, uint32_t src_h, uint16_t *dst, uint32_t dst_w,
+                           uint32_t dst_h, const uint16_t *x_map, const uint16_t *y_map) {
+  if (x_map == nullptr || y_map == nullptr) {
+    i420_copy_rgb565(src, src_w, src_h, dst, dst_w, dst_h);
+  } else {
+    i420_scale_rgb565(src, src_w, src_h, dst, dst_w, dst_h, x_map, y_map);
   }
 }
 
@@ -181,8 +328,17 @@ void H264Video::setup() {
 void H264Video::dump_config() {
   ESP_LOGCONFIG(TAG, "H264 Video:");
   ESP_LOGCONFIG(TAG, "  Listen Port: %u", (unsigned) this->port_);
-  ESP_LOGCONFIG(TAG, "  Display: %ux%u RGB565 (decoded %ux%u, cropped)", (unsigned) FRAME_WIDTH,
-                (unsigned) FRAME_HEIGHT, (unsigned) FRAME_WIDTH, (unsigned) EXPECTED_DECODE_HEIGHT);
+  ESP_LOGCONFIG(TAG, "  Source: %ux%u decoded (%u visible row(s), %u cropped)", (unsigned) this->source_width_,
+                (unsigned) this->source_height_, (unsigned) this->visible_height_,
+                (unsigned) (this->source_height_ - this->visible_height_));
+  if (this->is_scaling()) {
+    ESP_LOGCONFIG(TAG, "  Output: %ux%u RGB565 (scaling %ux%u -> %ux%u, nearest neighbour)",
+                  (unsigned) this->output_width_, (unsigned) this->output_height_, (unsigned) this->source_width_,
+                  (unsigned) this->visible_height_, (unsigned) this->output_width_, (unsigned) this->output_height_);
+  } else {
+    ESP_LOGCONFIG(TAG, "  Output: %ux%u RGB565 (1:1, no scaling)", (unsigned) this->output_width_,
+                  (unsigned) this->output_height_);
+  }
   ESP_LOGCONFIG(TAG, "  Frame Timeout: %u ms", (unsigned) this->frame_timeout_ms_);
   ESP_LOGCONFIG(TAG, "  Task: core %d, priority %u, %u byte stack", TASK_CORE, (unsigned) TASK_PRIORITY,
                 (unsigned) TASK_STACK_SIZE);
@@ -244,19 +400,25 @@ void H264Video::close_socket_() {
 }
 
 bool H264Video::alloc_buffers_() {
-  // PSRAM for everything. 64800 bytes per framebuffer would be a painful bite
-  // out of internal RAM next to WiFi and the audio path, and neither buffer is
-  // touched from an ISR.
+  // PSRAM for everything. A framebuffer is output_width x output_height x 2 -
+  // 64,800 bytes for the small panel and 768,000 for the 800x480 one - which
+  // would be a painful bite out of internal RAM next to WiFi and the audio
+  // path, and neither buffer is touched from an ISR. The scale tables are the
+  // one exception; see build_scale_maps_().
+  const uint32_t fb_bytes = this->fb_bytes_();
   for (int i = 0; i < 2; i++) {
-    this->fb_[i] = (uint16_t *) heap_caps_malloc(FB_BYTES, MALLOC_CAP_SPIRAM);
+    this->fb_[i] = (uint16_t *) heap_caps_malloc(fb_bytes, MALLOC_CAP_SPIRAM);
     if (this->fb_[i] == nullptr) {
-      ESP_LOGE(TAG, "Failed to allocate %u byte framebuffer %d in PSRAM", (unsigned) FB_BYTES, i);
+      ESP_LOGE(TAG, "Failed to allocate %u byte framebuffer %d in PSRAM", (unsigned) fb_bytes, i);
       return false;
     }
     // Black rather than whatever the allocator handed back: a consumer that
     // draws before the first decode should see a blank panel, not PSRAM noise.
-    memset(this->fb_[i], 0, FB_BYTES);
+    memset(this->fb_[i], 0, fb_bytes);
   }
+
+  if (!this->build_scale_maps_())
+    return false;
 
   this->nal_buf_ = (uint8_t *) heap_caps_malloc(MAX_NAL_SIZE + sizeof(START_CODE), MALLOC_CAP_SPIRAM);
   if (this->nal_buf_ == nullptr) {
@@ -278,7 +440,7 @@ bool H264Video::alloc_buffers_() {
 #if LVGL_VERSION_MAJOR >= 9
     d.header.magic = LV_IMAGE_HEADER_MAGIC;
     d.header.cf = LV_COLOR_FORMAT_RGB565;
-    d.header.stride = FRAME_WIDTH * 2;
+    d.header.stride = this->output_width_ * 2;
 #else
     d.header.always_zero = 0;
     // TRUE_COLOR means "already in lv_color_t layout", which on this build is
@@ -286,9 +448,9 @@ bool H264Video::alloc_buffers_() {
     // per-frame decode step in LVGL.
     d.header.cf = LV_IMG_CF_TRUE_COLOR;
 #endif
-    d.header.w = FRAME_WIDTH;
-    d.header.h = FRAME_HEIGHT;
-    d.data_size = FB_BYTES;
+    d.header.w = this->output_width_;
+    d.header.h = this->output_height_;
+    d.data_size = fb_bytes;
     d.data = (const uint8_t *) this->fb_[i];
   }
 #endif
@@ -311,12 +473,62 @@ void H264Video::free_buffers_() {
     heap_caps_free(this->rx_buf_);
     this->rx_buf_ = nullptr;
   }
+  this->free_scale_maps_();
 #ifdef USE_LVGL
   // The descriptors point at buffers that no longer exist. get_frame() is
   // already gated on published_index_, but zeroing these means a stale
   // descriptor cannot be dereferenced into freed PSRAM by anything else.
   memset(this->img_dsc_, 0, sizeof(this->img_dsc_));
 #endif
+}
+
+bool H264Video::build_scale_maps_() {
+  this->free_scale_maps_();
+
+  // No resample, no tables. The null pair is what selects the 1:1 loop in the
+  // converter, so this is not merely an allocation saved.
+  if (!this->is_scaling())
+    return true;
+
+  const uint32_t src_w = this->source_width_;
+  const uint32_t src_h = this->visible_height_;
+  const uint32_t dst_w = this->output_width_;
+  const uint32_t dst_h = this->output_height_;
+
+  // Internal RAM. Together they are a few KB - 2,560 bytes for 800x480 - and
+  // they are the only randomly-indexed reads in the inner loop, so they are the
+  // one thing here that should not be in PSRAM.
+  this->x_map_ = (uint16_t *) heap_caps_malloc(dst_w * sizeof(uint16_t), MALLOC_CAP_INTERNAL);
+  this->y_map_ = (uint16_t *) heap_caps_malloc(dst_h * sizeof(uint16_t), MALLOC_CAP_INTERNAL);
+  if (this->x_map_ == nullptr || this->y_map_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to allocate %u byte scale tables", (unsigned) ((dst_w + dst_h) * sizeof(uint16_t)));
+    this->free_scale_maps_();
+    return false;
+  }
+
+  for (uint32_t i = 0; i < dst_w; i++)
+    this->x_map_[i] = nn_src_index(i, src_w, dst_w);
+  for (uint32_t i = 0; i < dst_h; i++)
+    this->y_map_[i] = nn_src_index(i, src_h, dst_h);
+
+  // Built from visible_height, never source_height: that is the entire crop.
+  // The padding rows the encoder added to reach macroblock alignment have no
+  // output row mapped to them and are never read.
+  ESP_LOGD(TAG, "Scale tables built: %ux%u -> %ux%u (x %u..%u, y %u..%u)", (unsigned) src_w, (unsigned) src_h,
+           (unsigned) dst_w, (unsigned) dst_h, (unsigned) this->x_map_[0], (unsigned) this->x_map_[dst_w - 1],
+           (unsigned) this->y_map_[0], (unsigned) this->y_map_[dst_h - 1]);
+  return true;
+}
+
+void H264Video::free_scale_maps_() {
+  if (this->x_map_ != nullptr) {
+    heap_caps_free(this->x_map_);
+    this->x_map_ = nullptr;
+  }
+  if (this->y_map_ != nullptr) {
+    heap_caps_free(this->y_map_);
+    this->y_map_ = nullptr;
+  }
 }
 
 bool H264Video::open_decoder_() {
@@ -352,8 +564,8 @@ bool H264Video::open_decoder_() {
   // through the out frame, and it is not known until an SPS has been parsed, so
   // this handle is fetched now and queried after each picture.
   if (esp_h264_dec_sw_get_param_hd(this->decoder_, &this->decoder_param_) != ESP_H264_ERR_OK) {
-    ESP_LOGW(TAG, "Could not get decoder param handle; falling back to %ux%u", (unsigned) FRAME_WIDTH,
-             (unsigned) EXPECTED_DECODE_HEIGHT);
+    ESP_LOGW(TAG, "Could not get decoder param handle; falling back to %ux%u", (unsigned) this->source_width_,
+             (unsigned) this->source_height_);
     this->decoder_param_ = nullptr;
   }
 
@@ -505,8 +717,8 @@ void H264Video::decode_nal_(uint32_t nal_len_with_start_code) {
         // outbuf points straight into the decoder's DPB and is overwritten by
         // the next process call, so the conversion has to happen here, before
         // the loop goes round again - not queued for later.
-        uint32_t src_w = FRAME_WIDTH;
-        uint32_t src_h = EXPECTED_DECODE_HEIGHT;
+        uint32_t src_w = this->source_width_;
+        uint32_t src_h = this->source_height_;
         esp_h264_resolution_t res = {};
         if (this->decoder_param_ != nullptr &&
             esp_h264_dec_get_resolution(this->decoder_param_, &res) == ESP_H264_ERR_OK && res.width > 0 &&
@@ -517,16 +729,21 @@ void H264Video::decode_nal_(uint32_t nal_len_with_start_code) {
 
         // The reported geometry has to agree with the buffer we were handed, or
         // the plane offsets computed from it would read outside it. I420 is
-        // 1.5 bytes per pixel.
+        // 1.5 bytes per pixel. When the decoder will not say, src_w/src_h are
+        // the configured source geometry, so this is still a real check and not
+        // a tautology.
         if ((uint32_t) (src_w * src_h + (src_w * src_h >> 1)) > out.out_size) {
           ESP_LOGW(TAG, "Decoder geometry %ux%u disagrees with %u byte output; skipping frame", (unsigned) src_w,
                    (unsigned) src_h, (unsigned) out.out_size);
           this->decode_errors_.fetch_add(1, std::memory_order_relaxed);
         } else {
           // Crop happens here and nowhere else: the decoder never applies the
-          // SPS cropping window, so src_h is the macroblock-aligned 144 and we
-          // simply stop after FRAME_HEIGHT rows.
-          i420_to_rgb565(out.outbuf, src_w, src_h, this->fb_[this->back_index_], FRAME_WIDTH, FRAME_HEIGHT);
+          // SPS cropping window, so src_h is the macroblock-aligned height and
+          // only the visible rows are converted. At 1:1 that is the dst_h clip
+          // inside the loop; when scaling, y_map_ was built over visible_height
+          // and no output row maps to a padding one.
+          i420_to_rgb565(out.outbuf, src_w, src_h, this->fb_[this->back_index_], this->output_width_,
+                         this->output_height_, this->x_map_, this->y_map_);
           this->publish_frame_();
           produced = true;
         }

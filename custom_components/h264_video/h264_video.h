@@ -28,12 +28,27 @@
 namespace esphome {
 namespace h264_video {
 
-// The display is 240x135, but the decoder returns macroblock-aligned frames and
-// 135 is not a multiple of 16. The sender therefore encodes 240x144 and we take
-// the top 135 rows. Both numbers have to exist here: one sizes the RGB565
-// buffers, the other is what the decoder will actually hand back.
-static const uint16_t FRAME_WIDTH = 240;
-static const uint16_t FRAME_HEIGHT = 135;
+// Geometry is configuration, not a constant, because two very different panels
+// share this component: a 240x135 ST7789 fed a 240x144 stream, and an 800x480
+// RGB panel fed a 480x288 one.
+//
+// Three separate rectangles have to be tracked and they are all different sizes:
+//
+//   source        what the decoder hands back. Macroblock-aligned, because the
+//                 decoder applies no cropping window - 240x144 or 480x288.
+//   visible       how many of those rows are real picture rather than encoder
+//                 padding. 135 of the 240x144; all 288 of the 480x288.
+//   output        the RGB565 buffer LVGL draws from. Equal to source x visible
+//                 on the small panel, 800x480 on the large one, in which case
+//                 the colour conversion scales on the way through.
+//
+// The defaults below reproduce the original hard-wired 240x144 -> 240x135
+// behaviour exactly, so a config that sets none of these is unchanged.
+static const uint16_t DEFAULT_SOURCE_WIDTH = 240;
+static const uint16_t DEFAULT_SOURCE_HEIGHT = 144;
+static const uint16_t DEFAULT_VISIBLE_HEIGHT = 135;
+static const uint16_t DEFAULT_OUTPUT_WIDTH = 240;
+static const uint16_t DEFAULT_OUTPUT_HEIGHT = 135;
 
 class H264Video : public Component {
  public:
@@ -43,6 +58,28 @@ class H264Video : public Component {
 
   void set_port(uint16_t port) { this->port_ = port; }
   void set_frame_timeout(uint32_t timeout_ms) { this->frame_timeout_ms_ = timeout_ms; }
+
+  // Geometry. All five are validated in __init__.py - source_width and
+  // source_height are multiples of 16 there because a source that is not
+  // macroblock-aligned does not fail here, it silently produces sheared rows.
+  void set_source_size(uint16_t w, uint16_t h) {
+    this->source_width_ = w;
+    this->source_height_ = h;
+  }
+  void set_visible_height(uint16_t h) { this->visible_height_ = h; }
+  void set_output_size(uint16_t w, uint16_t h) {
+    this->output_width_ = w;
+    this->output_height_ = h;
+  }
+
+  uint16_t get_output_width() const { return this->output_width_; }
+  uint16_t get_output_height() const { return this->output_height_; }
+
+  // True when the converter has to resample rather than copy - i.e. whenever
+  // the output rectangle differs from the visible part of the source.
+  bool is_scaling() const {
+    return this->output_width_ != this->source_width_ || this->output_height_ != this->visible_height_;
+  }
 
   // ─────────────────────────────────────────────────────────────────────────
   // Lifecycle (main loop only)
@@ -91,6 +128,14 @@ class H264Video : public Component {
   void close_socket_();
   bool alloc_buffers_();
   void free_buffers_();
+
+  // Nearest-neighbour source-index tables, one entry per output column and per
+  // output row. Built once when the buffers are, so the inner loop does a table
+  // lookup instead of a multiply and a divide per pixel. Both stay nullptr when
+  // no scaling is needed, and that null is what selects the fast copy path in
+  // the converter.
+  bool build_scale_maps_();
+  void free_scale_maps_();
   bool open_decoder_();
   void close_decoder_();
 
@@ -107,6 +152,16 @@ class H264Video : public Component {
 
   uint16_t port_{12347};
   uint32_t frame_timeout_ms_{3000};
+
+  uint16_t source_width_{DEFAULT_SOURCE_WIDTH};
+  uint16_t source_height_{DEFAULT_SOURCE_HEIGHT};
+  uint16_t visible_height_{DEFAULT_VISIBLE_HEIGHT};
+  uint16_t output_width_{DEFAULT_OUTPUT_WIDTH};
+  uint16_t output_height_{DEFAULT_OUTPUT_HEIGHT};
+
+  // Size of one RGB565 framebuffer. Not a compile-time constant any more, so
+  // every allocation, memset and descriptor field goes through this.
+  uint32_t fb_bytes_() const { return (uint32_t) this->output_width_ * this->output_height_ * 2; }
 
   int socket_{-1};
   TaskHandle_t task_handle_{nullptr};
@@ -142,6 +197,11 @@ class H264Video : public Component {
   // Double-buffered output. The task only ever writes fb_[back_index_]; LVGL
   // only ever reads fb_[published_index_].
   uint16_t *fb_[2]{nullptr, nullptr};
+
+  // Internal RAM, not PSRAM: these are read once per output pixel, which is the
+  // one access pattern in the converter that is not a long forward sweep.
+  uint16_t *x_map_{nullptr};
+  uint16_t *y_map_{nullptr};
 #ifdef USE_LVGL
   lv_img_dsc_t img_dsc_[2]{};
 #endif
