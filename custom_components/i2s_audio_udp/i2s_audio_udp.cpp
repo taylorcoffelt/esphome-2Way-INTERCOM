@@ -50,6 +50,13 @@ void I2SAudioUDP::setup() {
   // Deduce bus mode and audio mode from pin configuration
   this->deduce_modes_();
 
+  // Monitor-only never brings I2S up, here or in start(). Nothing to set up
+  // for it beyond this line: the sockets and the task are shared with the
+  // normal path and are created by start() exactly as they always were.
+  if (this->monitor_only_) {
+    ESP_LOGI(TAG, "Monitor-only mode: levels only, I2S will not be initialized");
+  }
+
   // Enable speaker amplifier if configured
   if (this->speaker_enable_pin_ >= 0) {
     gpio_config_t io_conf = {};
@@ -63,6 +70,18 @@ void I2SAudioUDP::setup() {
 }
 
 void I2SAudioUDP::dump_config() {
+  // Monitor-only returns early rather than printing the usual block with the
+  // hardware lines blanked out: bus mode, slot layout and mic settings are all
+  // deduced from pins that this mode never uses, so printing them would only
+  // invite someone to debug a codec that is not there.
+  if (this->monitor_only_) {
+    ESP_LOGCONFIG(TAG, "I2S Audio UDP:");
+    ESP_LOGCONFIG(TAG, "  Mode: MONITOR ONLY (levels only - no I2S, no codec, no audio output)");
+    ESP_LOGCONFIG(TAG, "  Audio Mode: %s (forced)", this->get_audio_mode_text());
+    ESP_LOGCONFIG(TAG, "  Sample Rate: %d Hz (assumed format of the incoming PCM)", this->sample_rate_);
+    return;
+  }
+
   ESP_LOGCONFIG(TAG, "I2S Audio UDP:");
   ESP_LOGCONFIG(TAG, "  Bus Mode: %s", this->bus_mode_ == I2S_BUS_SINGLE ? "SINGLE" : "DUAL");
   ESP_LOGCONFIG(TAG, "  Audio Mode: %s", this->get_audio_mode_text());
@@ -108,6 +127,15 @@ void I2SAudioUDP::deduce_modes_() {
   } else {
     this->audio_mode_ = AUDIO_MODE_RX_ONLY;
   }
+
+  // Monitor-only is receive-only by definition: it measures what arrives and
+  // has nothing of its own to send. Pinned here rather than left to the
+  // deduction above so that a config which still carries the intercom's pins -
+  // harmless in itself, they are never used - cannot talk init_sockets_() into
+  // opening a send socket for a microphone that is not wired to anything.
+  if (this->monitor_only_) {
+    this->audio_mode_ = AUDIO_MODE_RX_ONLY;
+  }
 }
 
 const char* I2SAudioUDP::get_audio_mode_text() const {
@@ -139,10 +167,29 @@ bool I2SAudioUDP::speaker_is_stereo_() const {
   return this->bus_mode_ == I2S_BUS_SINGLE;
 }
 
+// One line, once, for a call monitor-only mode cannot honour. Silence would be
+// worse - the usual reason to reach these is a YAML copied from the intercom
+// onto a panel, and that wants saying out loud at least once - but so would
+// repeating it, since the callers are automations that fire on a button.
+void I2SAudioUDP::warn_monitor_noop_(const char *what, bool &warned) {
+  if (warned)
+    return;
+  warned = true;
+  ESP_LOGW(TAG, "%s: ignored - monitor_only mode has no I2S and no audio output", what);
+}
+
 // Note: decay_ms carries no default here. It is declared with one in the
 // header, and repeating it in the definition is a redefinition error.
 void I2SAudioUDP::play_tone(uint32_t freq_hz, uint32_t duration_ms, float amplitude,
                             uint32_t decay_ms) {
+  // Ahead of every other check, because the ones below assume there is a
+  // speaker path to reason about. There is nothing here to make a sound with,
+  // and the idle branch of this function would otherwise try to bring an I2S
+  // channel up on pins the panel has not got.
+  if (this->monitor_only_) {
+    this->warn_monitor_noop_("play_tone", this->warned_tone_noop_);
+    return;
+  }
   if (this->audio_mode_ == AUDIO_MODE_TX_ONLY) {
     ESP_LOGW(TAG, "play_tone: no speaker configured (TX_ONLY)");
     return;
@@ -543,6 +590,111 @@ void I2SAudioUDP::close_sockets_() {
 void I2SAudioUDP::audio_task(void *params) {
   I2SAudioUDP *self = (I2SAudioUDP *)params;
 
+  // ═════════════════════════════════════════════════════════════════════════
+  // MONITOR-ONLY: receive, measure, discard
+  // ═════════════════════════════════════════════════════════════════════════
+  // A whole separate loop, taken before a single byte is allocated, rather
+  // than conditionals sprinkled through the real one. Everything below this
+  // block - the ring buffer, the mic/speaker/widening buffers, the prebuffer
+  // and underrun state machine - exists to feed an I2S channel that in this
+  // mode does not exist, so guarding it all would leave allocations and a
+  // jitter buffer serving nobody while adding branches to the live playback
+  // path of a device that is actually in use. Splitting here costs a few
+  // duplicated lines and keeps the streaming path untouched.
+  if (self->monitor_only_) {
+    // recvfrom writes bytes, the payload is 16-bit little-endian PCM, and the
+    // measurement below reads it as int16_t. alignas is not decoration: a
+    // uint8_t array carries no alignment guarantee of its own, and a 16-bit
+    // load from an odd address is a LoadStoreAlignment exception on Xtensa.
+    alignas(int16_t) uint8_t rx_buffer[AUDIO_BUFFER_SIZE];
+    uint32_t last_stats_log = 0;
+
+    while (self->streaming_) {
+      bool did_work = false;
+
+      if (self->recv_socket_ >= 0) {
+        // Drain up to ten datagrams per pass, same as the streaming path, so a
+        // burst clears in one trip round the loop instead of ten.
+        for (int i = 0; i < 10; i++) {
+          ssize_t received = recvfrom(self->recv_socket_, rx_buffer, AUDIO_BUFFER_SIZE,
+                                       0, nullptr, nullptr);
+          if (received <= 0)
+            break;
+
+          self->rx_packets_++;
+          did_work = true;
+
+          // Deliberately the same arithmetic as the speaker path: integer
+          // absolute maximum over the chunk, scaled by 32768, then decayed
+          // against the previous value so silence falls away smoothly instead
+          // of snapping to zero between packets. A waveform drawn on the panel
+          // has to look like the one drawn on the intercom, which means the
+          // numbers behind it cannot be computed a second, different way.
+          //
+          // An odd trailing byte is dropped rather than half-read: a partial
+          // sample is not a sample, and the packet lengths in practice are
+          // whole frames anyway.
+          const size_t samples = (size_t) received / sizeof(int16_t);
+          const int16_t *pcm = (const int16_t *) rx_buffer;
+          int32_t chunk_max = 0;
+          for (size_t n = 0; n < samples; n++) {
+            int32_t mag = (pcm[n] < 0) ? -(int32_t) pcm[n] : (int32_t) pcm[n];
+            if (mag > chunk_max)
+              chunk_max = mag;
+          }
+          const float chunk_peak = (float) chunk_max / 32768.0f;
+          const float decayed = self->peak_level_.load() * 0.85f;
+          const float level = chunk_peak > decayed ? chunk_peak : decayed;
+          self->peak_level_.store(level);
+          self->push_level_(level);
+
+          // And that is the end of the audio. Nothing is written to a ring
+          // buffer, because in this mode nothing would ever read it back out.
+        }
+      }
+
+      // Periodic stats. Deliberately without the buf= field the streaming path
+      // logs: there is no ring buffer here to ask, and dereferencing the null
+      // unique_ptr to find that out would be a reboot.
+      uint32_t now = millis();
+      if (now - last_stats_log > 5000) {
+        ESP_LOGD(TAG, "Stats: RX=%u (monitor-only)", self->rx_packets_);
+        last_stats_log = now;
+      }
+
+      // The one thing keeping this task off its core.
+      //
+      // In the streaming path a mic read or an i2s_channel_write blocks at the
+      // sample rate and paces the loop even when this yield is skipped. Here
+      // nothing blocks at all: the socket is non-blocking, and the measurement
+      // is a few hundred integer comparisons. So every pass that receives
+      // nothing MUST reach this - do not add an early `continue` above, and do
+      // not make the yield conditional on anything else. A pass that did
+      // receive skips it and goes straight back to recvfrom, which is the
+      // point; the packet after it is ~16ms away at 16kHz, so the very next
+      // pass finds the socket empty and lands here.
+      //
+      // vTaskDelay(1), not pdMS_TO_TICKS(n), for the same reason as below: at
+      // a 100 Hz tick anything under 10ms truncates to 0, and vTaskDelay(0)
+      // only yields to equal priority - the priority-0 idle task would still
+      // never run, and the watchdog would panic the device.
+      if (!did_work) {
+        vTaskDelay(1);
+      }
+    }
+
+    // Nothing to free: this mode allocated nothing, and it must not touch
+    // anything stop() owns. The handshake below is the same one the full path
+    // uses and has to stay that way - stop() joins on task_done_, and a task
+    // that leaves without giving it makes that join sit out its whole 2s
+    // timeout waiting for a task that is already gone.
+    ESP_LOGD(TAG, "Audio task stopped (monitor-only)");
+    if (self->task_done_ != nullptr)
+      xSemaphoreGive(self->task_done_);
+    vTaskDelete(NULL);
+    return;
+  }
+
   int frame_size = 256;
 #ifdef USE_ESP_AEC
   if (self->aec_ != nullptr && self->aec_->is_initialized()) {
@@ -829,23 +981,32 @@ void I2SAudioUDP::start() {
 
   ESP_LOGI(TAG, "Starting audio streaming...");
 
-  // A play_tone() while idle may have left a channel open; start from a known
-  // state rather than trying to reuse it.
-  if (this->tx_handle_ != nullptr || this->rx_handle_ != nullptr) {
-    this->deinit_i2s_();
-  }
+  // Monitor-only skips the whole I2S half of startup - no channel allocation,
+  // no codec assumptions, no pins driven. Everything after this block is
+  // shared with the normal path on purpose, so both modes bind, start, signal
+  // and stop identically as far as any automation or UI can tell.
+  //
+  // The deinit_i2s_() calls further down the error paths and in stop() are
+  // left unguarded: with both handles null they do nothing but log.
+  if (!this->monitor_only_) {
+    // A play_tone() while idle may have left a channel open; start from a known
+    // state rather than trying to reuse it.
+    if (this->tx_handle_ != nullptr || this->rx_handle_ != nullptr) {
+      this->deinit_i2s_();
+    }
 
-  // Initialize I2S
-  bool i2s_ok = false;
-  if (this->bus_mode_ == I2S_BUS_SINGLE) {
-    i2s_ok = this->init_i2s_single_bus_();
-  } else {
-    i2s_ok = this->init_i2s_dual_bus_();
-  }
+    // Initialize I2S
+    bool i2s_ok = false;
+    if (this->bus_mode_ == I2S_BUS_SINGLE) {
+      i2s_ok = this->init_i2s_single_bus_();
+    } else {
+      i2s_ok = this->init_i2s_dual_bus_();
+    }
 
-  if (!i2s_ok) {
-    this->on_error_trigger_.trigger("I2S initialization failed");
-    return;
+    if (!i2s_ok) {
+      this->on_error_trigger_.trigger("I2S initialization failed");
+      return;
+    }
   }
 
   // Initialize sockets
